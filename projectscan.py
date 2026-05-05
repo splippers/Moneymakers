@@ -30,7 +30,7 @@ Over SSH, use ``--oauth-port 9876`` (or ``$PROJECTSCAN_DRIVE_OAUTH_PORT``) and m
 Workspace + GCP step-by-step (URLs for mobile copy/paste): ``./drive_workspace_setup_wizard.py``.
 
 Heuristic scoring changelog and audit expectations (demand curve, confidence tier, ``SCORE_BREAKDOWN``):
-see ``scoring_guidance.md`` and ``NOTES.md``.
+see ``Meta-Cursor-heuristic-algorythm-guidance.md`` (v1.1) and ``NOTES.md``.
 
 Restrict which Google login may upload: ``PROJECTSCAN_DRIVE_ALLOWED_EMAILS=jon@splippers.com`` (comma-separated).
 With an **Internal** OAuth consent screen (Google Workspace), only organisational accounts can consent; with
@@ -85,13 +85,6 @@ def index_file_json() -> Path:
 def index_file_csv() -> Path:
     return index_dir() / "repos.csv"
 
-# Portfolio weights — Meta/Cursor rubric: demand and path-to-revenue dominate raw codebase bulk.
-WEIGHTS = {
-    "value": 0.42,
-    "progress": 0.14,
-    "feature_potential": 0.12,
-    "effort_to_monetize": 0.32,
-}
 
 # Fields merged from previous JSON so annotations survive rescans
 PERSISTED_FIELDS = (
@@ -147,54 +140,20 @@ def run_git_command(repo_path: Path, cmd: list[str]) -> str:
         return ""
 
 
-def total_score_for(scores: dict[str, int]) -> float:
-    return round(sum(scores[k] * WEIGHTS[k] for k in WEIGHTS), 1)
-
-
 def estimate_money_usd(
     scores: dict[str, int],
     *,
     demand_evidence: int = 0,
     market_tag: str = "INTERNAL_TOOL",
+    manual_notes: str = "",
 ) -> tuple[int, int]:
-    """Illustrative yearly revenue band in USD from heuristic scores (not financial advice).
-
-    Uses explicit demand_evidence (0–50) and market_tag so bands track provable traction,
-    not polish alone — aligned with Meta/Cursor guidance.md.
-    """
-    v = scores["value"]
-    prog = scores["progress"]
-    fp = scores["feature_potential"]
-    ef = scores["effort_to_monetize"]
-    d = max(0, min(50, int(demand_evidence)))
-    demand_scaled = d * 2.0  # same 0–100 scale as other axes
-
-    composite = (
-        v * 0.34 + demand_scaled * 0.22 + prog * 0.11 + fp * 0.09 + ef * 0.24
-    ) / 100.0
-    composite = max(0.05, min(1.0, composite))
-
-    tag_scale = 1.0
-    if market_tag == "GAME":
-        tag_scale = 0.56
-    elif market_tag == "INTERNAL_TOOL":
-        tag_scale = 0.72
-    elif market_tag == "DEVTOOL":
-        tag_scale = 0.86 if d == 0 else 1.0
-    elif market_tag == "B2B_SAAS":
-        tag_scale = 1.04 if d > 0 else 0.90
-
-    anchor = (4200 + (composite**1.46) * 480_000) * tag_scale
-
-    wide = 1.62 + fp / 82.0 + (100 - prog) / 235.0
-    if d == 0:
-        wide += 0.18
-
-    low = max(400, int(round(anchor * 0.52, -2)))
-    high = max(low + 2000, int(round(anchor * wide, -2)))
-    low = min(low, 2_200_000)
-    high = min(high, 5_000_000)
-    return low, high
+    """P10/P90 USD/year ARR band from heuristic Monte Carlo–style model (not financial advice)."""
+    p10, _, p90, _ = estimate_revenue_band_monte_carlo(
+        demand_pts=demand_evidence,
+        market_tag=market_tag,
+        manual_notes=manual_notes,
+    )
+    return p10, p90
 
 
 def build_monetization(
@@ -657,6 +616,357 @@ def _npm_last_week_downloads(repo_path: Path) -> int | None:
         return None
 
 
+def _signal_norm_for_demand(count: int) -> float:
+    """Log-scaled 0–100 norm for a single traction count (Meta Cursor heuristic v1.1)."""
+    return min(100.0, 20.0 * math.log10(max(int(count), 0) + 1))
+
+
+def calc_demand_evidence_v11(signals: dict[str, int | None]) -> tuple[int, dict]:
+    """Demand 0–50 from the strongest available signal only (no averaging with missing npm/PyPI legs)."""
+    available: dict[str, int] = {}
+    for key in ("stars", "npm", "pypi", "waitlist"):
+        v = signals.get(key)
+        if v is not None:
+            available[key] = int(v)
+    src_line = {k: signals.get(k) for k in ("stars", "npm", "pypi", "waitlist")}
+    if not available:
+        return 0, {
+            "sources": src_line,
+            "demand_source_used": None,
+            "demand_combined_100": 0.0,
+            "formula": "demand_pts=min(50,round(combined_100/100*50)); combined=max(norm(signals present))",
+        }
+    norms = [(k, _signal_norm_for_demand(cnt)) for k, cnt in available.items()]
+    best_k, combined = max(norms, key=lambda x: x[1])
+    pts = min(50, max(0, int(round(combined / 100.0 * 50))))
+    return pts, {
+        "sources": src_line,
+        "demand_source_used": best_k,
+        "demand_combined_100": round(combined, 3),
+        "formula": "demand_pts=min(50,round(combined_100/100*50)); combined=max(norm per signal)",
+    }
+
+
+def _waitlist_count_from_notes(manual_notes: str) -> int | None:
+    m = re.search(r"waitlist\s*[=:]\s*(\d+)", manual_notes, flags=re.I)
+    return int(m.group(1)) if m else None
+
+
+def _pypi_monthly_downloads(repo_path: Path) -> int | None:
+    """Reserved for PyPI proxy; return None until a stable API path is wired."""
+    _ = repo_path
+    return None
+
+
+def infra_breakdown_v11(
+    *,
+    has_package: bool,
+    has_api: bool,
+    has_docker: bool,
+    commit_count: int,
+    has_readme: bool,
+    has_license: bool,
+) -> tuple[int, dict[str, int]]:
+    breakdown = {
+        "package": 10 if has_package else 0,
+        "api_layout": 10 if has_api else 0,
+        "docker": 5 if has_docker else 0,
+        "commits_gt_50": 5 if commit_count >= 50 else 0,
+        "readme_licence": 5 if (has_readme and has_license) else (3 if has_readme else 0),
+    }
+    total = min(35, sum(breakdown.values()))
+    return total, breakdown
+
+
+def _github_pain_issue_points(repo_path: Path) -> int:
+    _ = repo_path
+    return 0
+
+
+def problem_evidence_v11(manual_notes: str, repo_path: Path) -> tuple[int, dict[str, int]]:
+    pts = 0
+    sources = {"manual_notes": 0, "github_issues_tagged_pain": 0, "external_mentions": 0}
+    low = manual_notes.lower()
+    if re.search(r"waitlist|beta users|design partners", low):
+        pts += 15
+        sources["manual_notes"] += 15
+    if re.search(r"loi|letter of intent|prepaid|pilot\s*\$?\d", low, re.I):
+        pts += 25
+        sources["manual_notes"] += 25
+    gh = _github_pain_issue_points(repo_path)
+    sources["github_issues_tagged_pain"] = gh
+    pts += gh
+    ext = 0
+    sources["external_mentions"] = ext
+    if ext > 5:
+        pts += 10
+    return min(60, pts), sources
+
+
+def _readme_licence_points(has_readme: bool, has_license: bool) -> int:
+    return 5 if (has_readme and has_license) else (3 if has_readme else 0)
+
+
+def confidence_v11(
+    *,
+    demand_source_used: str | None,
+    readme_licence_pts: int,
+    risk_flags: list[str],
+) -> str:
+    if "ABANDONMENT_RISK" in risk_flags or "HIT_DRIVEN_VOLATILITY" in risk_flags:
+        return "Low"
+    if demand_source_used is None and readme_licence_pts < 5:
+        return "Low"
+    if demand_source_used is not None and readme_licence_pts >= 5:
+        return "High"
+    if demand_source_used is not None or readme_licence_pts >= 5:
+        return "Med"
+    return "Low"
+
+
+def collect_risk_flags_v11(
+    *,
+    market_tag: str,
+    demand_pts: int,
+    days_since_commit: int | None,
+) -> list[str]:
+    flags: list[str] = []
+    if market_tag == "GAME" and demand_pts < 20:
+        flags.append("HIT_DRIVEN_VOLATILITY")
+    if demand_pts == 0:
+        flags.append("NO_MARKET_PULL")
+    if days_since_commit is not None and days_since_commit > 90:
+        flags.append("ABANDONMENT_RISK")
+    return flags
+
+
+def gtm_readiness_for(effort_to_monetize: int, progress: int) -> float:
+    return round(0.7 * float(effort_to_monetize) + 0.3 * float(progress), 1)
+
+
+def estimate_revenue_band_monte_carlo(
+    *,
+    demand_pts: int,
+    market_tag: str,
+    manual_notes: str,
+) -> tuple[int, int, int, dict]:
+    """Heuristic P10/P50/P90 annual USD ARR with logged assumptions (Monte Carlo–style spread)."""
+    d = max(0, min(50, int(demand_pts)))
+    tag = market_tag or "INTERNAL_TOOL"
+    conversion = {"DEVTOOL": 5, "GAME": 6, "B2B_SAAS": 4, "INTERNAL_TOOL": 2}.get(tag, 3)
+    base_acv = {"DEVTOOL": 1200, "GAME": 800, "B2B_SAAS": 2400, "INTERNAL_TOOL": 600}.get(tag, 900)
+
+    loi_m = re.search(r"(?:LOI|letter of intent)\s*[=:]?\s*\$?\s*([\d,]+)", manual_notes, re.I)
+    if loi_m:
+        try:
+            loi_val = int(loi_m.group(1).replace(",", ""))
+            base_acv = max(base_acv, max(500, loi_val // 10))
+        except ValueError:
+            pass
+
+    if d == 0:
+        assumptions = {
+            "market_tag": tag,
+            "demand_pts": d,
+            "note": "no_traction_bands",
+            "p50_anchor_usd": 2500,
+        }
+        return 0, 2500, 10_000, assumptions
+
+    payers_p50 = max(1, d * conversion)
+    arr_p50 = int(base_acv * payers_p50)
+    arr_p10 = int(arr_p50 * 0.6)
+    arr_p90 = int(arr_p50 * 1.5)
+    assumptions = {
+        "market_tag": tag,
+        "demand_pts": d,
+        "base_acv_usd_per_year": base_acv,
+        "conversion_factor": conversion,
+        "payers_p50": payers_p50,
+        "churn_annual": 0.2,
+        "method": "heuristic_p10_p50_p90_spread",
+    }
+    return arr_p10, arr_p50, arr_p90, assumptions
+
+
+def _days_since_commit(repo_path: Path) -> int | None:
+    raw = run_git_command(repo_path, ["log", "-1", "--format=%ct"])
+    if raw.isdigit():
+        return max(0, int((time.time() - int(raw)) / 86400))
+    return None
+
+
+def populate_repo_scoring(repo: dict) -> None:
+    """Apply Meta Cursor heuristic schema v1.1 — mutates repo (see Meta-Cursor-heuristic-algorythm-guidance.md)."""
+    path_s = repo.get("path")
+    if not path_s or not isinstance(path_s, str):
+        return
+    rp = Path(path_s)
+    if not rp.is_dir():
+        return
+
+    manual_notes = str(repo.get("manual_notes") or "")
+    monetization_notes = str(repo.get("monetization_notes") or "")
+
+    if (rp / ".git").is_dir():
+        if "signal_github_stars" not in repo:
+            repo["signal_github_stars"] = _lookup_github_stars(rp)
+        if "signal_npm_weekly" not in repo:
+            repo["signal_npm_weekly"] = _npm_last_week_downloads(rp)
+        if "signal_pypi_monthly" not in repo:
+            repo["signal_pypi_monthly"] = _pypi_monthly_downloads(rp)
+        if "days_since_commit" not in repo:
+            repo["days_since_commit"] = _days_since_commit(rp)
+
+    stars = repo.get("signal_github_stars")
+    npm = repo.get("signal_npm_weekly")
+    pypi = repo.get("signal_pypi_monthly")
+    waitlist = _waitlist_count_from_notes(manual_notes)
+
+    signals: dict[str, int | None] = {
+        "stars": stars if stars is None else int(stars),
+        "npm": npm if npm is None else int(npm),
+        "pypi": pypi if pypi is None else int(pypi),
+        "waitlist": waitlist,
+    }
+    demand_pts, demand_audit = calc_demand_evidence_v11(signals)
+
+    has_package = bool(repo.get("has_package"))
+    has_api = bool(repo.get("has_api"))
+    has_docker = bool(repo.get("has_docker"))
+    has_readme = bool(repo.get("has_readme"))
+    has_license = bool(repo.get("has_license"))
+    commit_count = int(repo.get("commit_count") or 0)
+    market_tag = str(repo.get("market_tag") or "INTERNAL_TOOL")
+
+    infra_pts, infra_break = infra_breakdown_v11(
+        has_package=has_package,
+        has_api=has_api,
+        has_docker=has_docker,
+        commit_count=commit_count,
+        has_readme=has_readme,
+        has_license=has_license,
+    )
+    problem_pts, problem_src = problem_evidence_v11(manual_notes, rp)
+    readme_lic_pts = _readme_licence_points(has_readme, has_license)
+
+    base_value = min(100, demand_pts + infra_pts + problem_pts)
+
+    days_since = repo.get("days_since_commit")
+    if not isinstance(days_since, int):
+        days_since = None
+
+    risk_flags = collect_risk_flags_v11(
+        market_tag=market_tag,
+        demand_pts=demand_pts,
+        days_since_commit=days_since,
+    )
+    recency_mult = 0.5 if (days_since is not None and days_since > 90) else 1.0
+    recency_reason = f"last_commit_days={days_since if days_since is not None else 'unknown'}, threshold=90"
+
+    final_value = min(100, int(round(base_value * recency_mult)))
+
+    conf = confidence_v11(
+        demand_source_used=demand_audit.get("demand_source_used"),
+        readme_licence_pts=readme_lic_pts,
+        risk_flags=risk_flags,
+    )
+    if demand_pts == 0:
+        conf = "Low"
+    if market_tag == "GAME" and demand_pts < 20:
+        conf = "Low"
+
+    paths_lower = _tracked_paths_blob(rp)
+    progress = min(100, commit_count * 2)
+    if has_package:
+        progress += 10
+    if has_docker:
+        progress += 10
+    progress = min(100, progress)
+
+    effort_to_monetize = _effort_to_monetize_score(
+        market_tag=market_tag,
+        repo_path=rp,
+        paths_lower=paths_lower,
+        has_readme=has_readme,
+        has_license=has_license,
+        has_package=has_package,
+        has_docker=has_docker,
+        progress=progress,
+    )
+
+    feature_potential = 20
+    sc_old = repo.get("scores")
+    if isinstance(sc_old, dict) and "feature_potential" in sc_old:
+        try:
+            feature_potential = max(0, min(100, int(sc_old["feature_potential"])))
+        except (TypeError, ValueError):
+            feature_potential = 20
+
+    repo["scores"] = {
+        "value": final_value,
+        "progress": progress,
+        "feature_potential": feature_potential,
+        "effort_to_monetize": effort_to_monetize,
+    }
+    repo["demand_evidence"] = demand_pts
+    repo["scoring_confidence"] = conf
+
+    sb: dict = {
+        "schema": "1.1",
+        "demand_pts": demand_pts,
+        "demand": {
+            "sources": demand_audit["sources"],
+            "demand_source_used": demand_audit["demand_source_used"],
+            "demand_combined_100": demand_audit["demand_combined_100"],
+            "formula": demand_audit["formula"],
+        },
+        "infra_pts": infra_pts,
+        "infra": {
+            "breakdown": infra_break,
+            "formula": "infra_pts = min(35, sum(breakdown))",
+        },
+        "base_value": base_value,
+        "recency_multiplier": recency_mult,
+        "recency": {"reason": recency_reason},
+        "final_value": final_value,
+        "formula_final": "final_value = min(100, round(base_value * recency_multiplier))",
+        "risk_flags": risk_flags,
+        "confidence": conf,
+    }
+    if problem_pts > 0:
+        sb["problem_evidence_pts"] = problem_pts
+        sb["problem_evidence"] = {
+            "sources": problem_src,
+            "formula": "manual_notes regex + GitHub pain issues (stub) + external mentions (stub)",
+        }
+    repo["score_breakdown"] = sb
+
+    ra_mult = 0.5 if "ABANDONMENT_RISK" in risk_flags else 1.0
+    repo["risk_adjusted_value"] = round(float(final_value) * ra_mult, 3)
+
+    repo["data_gap"] = (
+        "DATA_GAP: No GTM hypothesis"
+        if (not manual_notes.strip() and not monetization_notes.strip())
+        else ""
+    )
+
+    gtm = gtm_readiness_for(effort_to_monetize, progress)
+    repo["gtm_readiness"] = gtm
+    repo["total_score"] = gtm
+
+    demand_hint_parts: list[str] = []
+    if stars is not None:
+        demand_hint_parts.append(f"GitHub ★ {stars}")
+    else:
+        demand_hint_parts.append("GitHub stars unknown (private host or API miss)")
+    if npm is not None:
+        demand_hint_parts.append(f"npm last-week ≈ {npm}")
+    if waitlist is not None:
+        demand_hint_parts.append(f"manual waitlist ≈ {waitlist}")
+    repo["demand_hint"] = "Demand signals: " + " · ".join(demand_hint_parts)
+
+
 def _payment_code_present(repo_path: Path) -> bool:
     return _git_grep_regex(
         repo_path,
@@ -795,98 +1105,6 @@ def _infer_market_tag(
     return "INTERNAL_TOOL"
 
 
-def _painkiller_points(readme_lower: str) -> int:
-    strong = (
-        "gdpr",
-        "hipaa",
-        "pci-dss",
-        "soc 2",
-        "payroll",
-        "invoice fraud",
-        "ransomware",
-        "disaster recovery",
-        "data breach",
-        "money laundering",
-        "tax filing",
-        "compliance audit",
-    )
-    medium = (
-        "sso",
-        "audit log",
-        "encryption at rest",
-        "backup",
-        "billing dispute",
-        "subscription billing",
-    )
-    s_hit = sum(1 for k in strong if k in readme_lower)
-    m_hit = sum(1 for k in medium if k in readme_lower)
-    if s_hit >= 2:
-        return 20
-    if s_hit == 1:
-        return 16
-    if m_hit >= 2:
-        return 10
-    if m_hit == 1:
-        return 6
-    if len(readme_lower) > 800:
-        return 5
-    return 0
-
-
-def _monetization_infra_points(repo_path: Path, paths_lower: str) -> int:
-    pay = _payment_code_present(repo_path)
-    auth = _has_auth_signals(paths_lower, repo_path)
-    price = _has_pricing_surface(paths_lower)
-    pts = 15 if pay else 0
-    pts += 10 if auth else 0
-    pts += 5 if price else 0
-    return min(30, pts)
-
-
-def _stars_log_norm(stars: int) -> float:
-    """0–100 curve per scoring_guidance.md: min(100, 20 * log10(stars + 1))."""
-    return min(100.0, 20.0 * math.log10(max(stars, 0) + 1))
-
-
-def _npm_log_norm(npm_weekly: int) -> float:
-    """0–100 npm weekly downloads proxy (same spirit as stars_log)."""
-    return min(100.0, 25.0 * math.log10(max(npm_weekly, 0) + 1))
-
-
-def _demand_evidence_points(
-    *,
-    stars: int | None,
-    npm_weekly: int | None,
-    market_tag: str,
-) -> tuple[int, dict[str, float | int | None]]:
-    """Demand 0–50 from log-scaled GitHub stars + npm weekly (scoring_guidance.md §2)."""
-    stars_log = _stars_log_norm(stars) if stars is not None else 0.0
-    npm_log = _npm_log_norm(npm_weekly) if npm_weekly is not None else 0.0
-    if market_tag == "DEVTOOL" and npm_weekly is not None and npm_weekly < 100:
-        npm_log = min(npm_log, 28.0)
-
-    external_norm = 0.0  # reddit/discord/trends — extend when wired
-    if stars is None and npm_weekly is not None:
-        w_stars, w_npm = 0.0, 1.0
-    elif stars is not None and npm_weekly is None:
-        w_stars, w_npm = 1.0, 0.0
-    else:
-        # scoring_guidance.md §2: 0.6 * stars_log + 0.4 * external (npm proxy here).
-        w_stars, w_npm = 0.6, 0.4
-    combined = min(
-        100.0,
-        w_stars * stars_log + w_npm * npm_log + 0.10 * external_norm,
-    )
-    pts = int(round(combined / 100.0 * 50))
-    pts = min(50, max(0, pts))
-    audit = {
-        "stars_log": round(stars_log, 3) if stars is not None else None,
-        "npm_log": round(npm_log, 3) if npm_weekly is not None else None,
-        "demand_combined_100": round(combined, 3),
-    }
-    return pts, audit
-
-
 def _market_segment_fields(
     market_tag: str,
     name_lower: str,
@@ -899,30 +1117,6 @@ def _market_segment_fields(
     if _signals_consumer_game_home_ar(name_lower, readme_lower, repo_path):
         return ("mass_market_computer_game", "Computer game for the masses")
     return ("computer_game", "Computer game")
-
-
-def _scoring_confidence(
-    *,
-    stars: int | None,
-    npm_weekly: int | None,
-    has_readme: bool,
-    monetization_notes: str,
-) -> str:
-    """Low/Med/High proxy from observable data completeness (scoring_guidance.md §6)."""
-    k = 0
-    if stars is not None:
-        k += 1
-    if npm_weekly is not None:
-        k += 1
-    if has_readme:
-        k += 1
-    if (monetization_notes or "").strip():
-        k += 1
-    if k >= 4:
-        return "High"
-    if k >= 2:
-        return "Med"
-    return "Low"
 
 
 def _effort_to_monetize_score(
@@ -970,8 +1164,8 @@ def _effort_to_monetize_score(
 def analyze_repo(repo_path: Path) -> dict:
     """Extract metrics and heuristic scores for a single repo.
 
-    Implements the demand-first rubric in ``Meta-Cursor-heuristic-algorythm-guidance.md``
-    using observable repo signals (GitHub stars, npm downloads, payment/auth/pricing code).
+    Schema **v1.1** — fully auditable ``score_breakdown``, demand = max(log norms),
+    ``total_score`` is **gtm_readiness** only (see ``Meta-Cursor-heuristic-algorythm-guidance.md``).
     """
     name = repo_path.name
     name_lower = name.lower()
@@ -997,15 +1191,6 @@ def analyze_repo(repo_path: Path) -> dict:
     has_docker = (repo_path / "Dockerfile").exists() or (repo_path / "docker-compose.yml").exists()
     has_api = any((repo_path / d).is_dir() for d in ("api", "server", "backend"))
 
-    progress = min(100, commit_count * 2)
-    if has_package:
-        progress += 10
-    if has_docker:
-        progress += 10
-    progress = min(100, progress)
-
-    stars = _lookup_github_stars(repo_path)
-    npm_weekly = _npm_last_week_downloads(repo_path)
     market_tag = _infer_market_tag(
         repo_path,
         name_lower,
@@ -1015,116 +1200,16 @@ def analyze_repo(repo_path: Path) -> dict:
         has_api=has_api,
     )
 
-    demand_pts, demand_audit = _demand_evidence_points(
-        stars=stars, npm_weekly=npm_weekly, market_tag=market_tag
-    )
-    infra_pts = _monetization_infra_points(repo_path, paths_lower)
-    pain_pts = _painkiller_points(readme_lower)
-
-    value = min(100, demand_pts + infra_pts + pain_pts)
-    if demand_pts == 0:
-        value = min(value, 40)
-    if demand_pts < 5:
-        value = min(value, 40)
-    if market_tag == "GAME":
-        value = min(value, 29)
-    if market_tag == "DEVTOOL" and npm_weekly is not None and npm_weekly < 100:
-        if stars is None or stars <= 50:
-            value = min(value, 38)
-
-    feature_potential = 20
-
-    effort_to_monetize = _effort_to_monetize_score(
-        market_tag=market_tag,
-        repo_path=repo_path,
-        paths_lower=paths_lower,
-        has_readme=has_readme,
-        has_license=has_license,
-        has_package=has_package,
-        has_docker=has_docker,
-        progress=progress,
-    )
-
-    scores = {
-        "value": value,
-        "progress": progress,
-        "feature_potential": feature_potential,
-        "effort_to_monetize": effort_to_monetize,
-    }
-    total = total_score_for(scores)
-    lo, hi = estimate_money_usd(scores, demand_evidence=demand_pts, market_tag=market_tag)
-    monetization = build_monetization(
-        file_count=file_count,
-        has_readme=has_readme,
-        has_license=has_license,
-        has_package=has_package,
-        has_docker=has_docker,
-        has_api=has_api,
-        value=value,
-        market_tag=market_tag,
-        demand_evidence=demand_pts,
-    )
-    distribution = pick_roi_distribution(
-        file_count=file_count,
-        has_readme=has_readme,
-        has_license=has_license,
-        has_package=has_package,
-        has_docker=has_docker,
-        has_api=has_api,
-        value=value,
-        progress=scores["progress"],
-        feature_potential=scores["feature_potential"],
-        effort_to_monetize=scores["effort_to_monetize"],
-        market_tag=market_tag,
-        demand_evidence=demand_pts,
-    )
-
-    demand_hint_parts: list[str] = []
-    if stars is not None:
-        demand_hint_parts.append(f"GitHub ★ {stars}")
-    else:
-        demand_hint_parts.append("GitHub stars unknown (private host or API miss)")
-    if npm_weekly is not None:
-        demand_hint_parts.append(f"npm last-week ≈ {npm_weekly}")
-    demand_hint = "Demand signals: " + " · ".join(demand_hint_parts)
-
     segment_slug, segment_label = _market_segment_fields(
         market_tag, name_lower, readme_lower, repo_path
     )
-    scoring_confidence = _scoring_confidence(
-        stars=stars,
-        npm_weekly=npm_weekly,
-        has_readme=has_readme,
-        monetization_notes="",
-    )
-    score_breakdown = {
-        "demand_pts": demand_pts,
-        "infra_pts": infra_pts,
-        "pain_pts": pain_pts,
-        "formula": "value=min(100,demand+infra+pain); demand=min(50,round(combined/100*50)); combined=0.6*stars_log+0.4*npm_log when both present",
-        **demand_audit,
-    }
-    caps_applied: list[str] = []
-    if demand_pts == 0:
-        caps_applied.append("demand_zero_cap40")
-    if demand_pts < 5:
-        caps_applied.append("demand_lt5_cap40")
-    if market_tag == "GAME":
-        caps_applied.append("game_cap29")
-    if market_tag == "DEVTOOL" and npm_weekly is not None and npm_weekly < 100:
-        if stars is None or stars <= 50:
-            caps_applied.append("devtool_low_npm_cap38")
-    score_breakdown["caps_applied"] = caps_applied
 
-    return {
+    repo = {
         "name": name,
         "path": str(repo_path.resolve()),
         "market_tag": market_tag,
         "market_segment": segment_slug,
         "market_segment_label": segment_label,
-        "demand_evidence": demand_pts,
-        "scoring_confidence": scoring_confidence,
-        "score_breakdown": score_breakdown,
         "last_commit": last_commit,
         "commit_count": commit_count,
         "file_count": file_count,
@@ -1133,23 +1218,22 @@ def analyze_repo(repo_path: Path) -> dict:
         "has_package": has_package,
         "has_api": has_api,
         "has_docker": has_docker,
-        "scores": scores,
-        "total_score": total,
         "manual_notes": "",
         "manual_value_override": None,
         "manual_money_low": None,
         "manual_money_high": None,
         "monetization_notes": "",
-        "money_usd_low": lo,
-        "money_usd_high": hi,
-        "monetization": monetization,
-        "roi_distribution": distribution,
-        "demand_hint": demand_hint,
         "importance": 3,
         "status": "active",
         "hidden": False,
         "last_updated": datetime.now().isoformat(timespec="seconds"),
     }
+
+    populate_repo_scoring(repo)
+    refresh_monetization_from_repo(repo)
+    refresh_money_usd(repo)
+
+    return repo
 
 
 def refresh_monetization_from_repo(repo: dict) -> None:
@@ -1187,13 +1271,13 @@ def refresh_monetization_from_repo(repo: dict) -> None:
 
 
 def refresh_money_usd(repo: dict) -> None:
-    """Set money_usd_low/high from scores or manual overrides."""
+    """Set money_usd_low/high (P10/P90), midpoint P50, and revenue assumptions."""
     scores = repo.get("scores")
     if not isinstance(scores, dict):
         return
     tag = str(repo.get("market_tag") or "INTERNAL_TOOL")
     dem = int(repo.get("demand_evidence") or 0)
-    auto_lo, auto_hi = estimate_money_usd(scores, demand_evidence=dem, market_tag=tag)
+    mn = str(repo.get("manual_notes") or "")
     ml, mh = repo.get("manual_money_low"), repo.get("manual_money_high")
     if ml is not None and mh is not None:
         try:
@@ -1201,11 +1285,19 @@ def refresh_money_usd(repo: dict) -> None:
             high = max(low, int(mh))
             repo["money_usd_low"] = low
             repo["money_usd_high"] = high
+            repo["money_usd_mid"] = int(round((low + high) / 2))
+            repo["revenue_assumptions"] = {"note": "manual_band_override"}
             return
         except (TypeError, ValueError):
             repo["manual_money_low"] = None
             repo["manual_money_high"] = None
-    repo["money_usd_low"], repo["money_usd_high"] = auto_lo, auto_hi
+    p10, p50, p90, asm = estimate_revenue_band_monte_carlo(
+        demand_pts=dem,
+        market_tag=tag,
+        manual_notes=mn,
+    )
+    repo["money_usd_low"], repo["money_usd_mid"], repo["money_usd_high"] = p10, p50, p90
+    repo["revenue_assumptions"] = asm
 
 
 def get_fx_payload() -> dict:
@@ -1262,21 +1354,32 @@ def merge_persisted(repo: dict, old: dict | None) -> None:
         for key in PERSISTED_FIELDS:
             if key in old:
                 repo[key] = old[key]
-        override = repo.get("manual_value_override")
-        if override is not None:
-            try:
-                v = int(override)
-                v = max(0, min(100, v))
-                repo["scores"]["value"] = v
-                repo["total_score"] = total_score_for(repo["scores"])
-            except (TypeError, ValueError):
-                repo["manual_value_override"] = None
+    populate_repo_scoring(repo)
+    flags = list((repo.get("score_breakdown") or {}).get("risk_flags") or [])
+    ra_mult = 0.5 if "ABANDONMENT_RISK" in flags else 1.0
+    override = repo.get("manual_value_override")
+    if override is not None:
+        try:
+            v = int(override)
+            v = max(0, min(100, v))
+            repo["scores"]["value"] = v
+            sb = repo.get("score_breakdown")
+            if isinstance(sb, dict):
+                sb["final_value"] = v
+        except (TypeError, ValueError):
+            repo["manual_value_override"] = None
+    repo["risk_adjusted_value"] = round(float((repo.get("scores") or {}).get("value") or 0) * ra_mult, 3)
+    sc = repo.get("scores") or {}
+    ef = int(sc.get("effort_to_monetize") or 0)
+    prog = int(sc.get("progress") or 0)
+    repo["gtm_readiness"] = gtm_readiness_for(ef, prog)
+    repo["total_score"] = repo["gtm_readiness"]
     refresh_monetization_from_repo(repo)
     refresh_money_usd(repo)
 
 
 def sort_key(repo: dict) -> tuple:
-    """Importance (5 first), then total score, then name."""
+    """Hidden last; importance; heuristic upside ``scores.value``; confidence tier; name."""
     imp = repo.get("importance")
     try:
         imp_n = int(imp) if imp is not None else 3
@@ -1284,7 +1387,23 @@ def sort_key(repo: dict) -> tuple:
         imp_n = 3
     imp_n = max(1, min(5, imp_n))
     hidden = bool(repo.get("hidden"))
-    return (hidden, -imp_n, -float(repo.get("total_score", 0)), repo.get("name", "").lower())
+    conf = repo.get("scoring_confidence") or "Low"
+    conf_n = {"High": 3, "Med": 2, "Low": 1}.get(conf, 1)
+    val = float((repo.get("scores") or {}).get("value") or 0)
+    return (hidden, -imp_n, -val, -conf_n, repo.get("name", "").lower())
+
+
+def assign_risk_adjusted_ranks(repos: list[dict]) -> None:
+    ordered = sorted(
+        repos,
+        key=lambda r: (
+            -float(r.get("risk_adjusted_value") or (r.get("scores") or {}).get("value") or 0),
+            str(r.get("name", "")).lower(),
+        ),
+    )
+    rank_map = {id(r): i + 1 for i, r in enumerate(ordered)}
+    for r in repos:
+        r["risk_adjusted_rank"] = rank_map.get(id(r), len(repos))
 
 
 def _scan_candidate_dirs(project_root: Path) -> list[Path]:
@@ -1352,6 +1471,7 @@ def scan_projects(root: Path | None = None) -> list[dict]:
         repos.append(repo)
 
     repos.sort(key=sort_key)
+    assign_risk_adjusted_ranks(repos)
 
     with open(jpath, "w", encoding="utf-8") as f:
         json.dump(repos, f, indent=2)
@@ -1440,19 +1560,33 @@ def save_repos(repos: list[dict]) -> None:
     idx = index_dir()
     idx.mkdir(parents=True, exist_ok=True)
     for r in repos:
-        if "scores" in r and isinstance(r["scores"], dict):
-            override = r.get("manual_value_override")
-            if override is not None:
-                try:
-                    v = max(0, min(100, int(override)))
-                    r["scores"]["value"] = v
-                except (TypeError, ValueError):
-                    pass
-            r["total_score"] = total_score_for(r["scores"])
+        if r.get("path"):
+            populate_repo_scoring(r)
+        override = r.get("manual_value_override")
+        if override is not None:
+            try:
+                v = max(0, min(100, int(override)))
+                r["scores"]["value"] = v
+                sb = r.get("score_breakdown")
+                if isinstance(sb, dict):
+                    sb["final_value"] = v
+            except (TypeError, ValueError):
+                pass
+        flags = list((r.get("score_breakdown") or {}).get("risk_flags") or [])
+        ra_mult = 0.5 if "ABANDONMENT_RISK" in flags else 1.0
+        if isinstance(r.get("scores"), dict):
+            r["risk_adjusted_value"] = round(float(r["scores"].get("value") or 0) * ra_mult, 3)
+            sc = r["scores"]
+            r["gtm_readiness"] = gtm_readiness_for(
+                int(sc.get("effort_to_monetize") or 0),
+                int(sc.get("progress") or 0),
+            )
+            r["total_score"] = r["gtm_readiness"]
         refresh_monetization_from_repo(r)
         refresh_money_usd(r)
         r["last_updated"] = datetime.now().isoformat(timespec="seconds")
     repos.sort(key=sort_key)
+    assign_risk_adjusted_ranks(repos)
     with open(index_file_json(), "w", encoding="utf-8") as f:
         json.dump(repos, f, indent=2)
 
@@ -2213,7 +2347,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <h2>${escapeHtml(r.name)}</h2>
             <span class="market-tag" title="Heuristic market tag (Meta/Cursor taxonomy)">${escapeHtml(r.market_tag || '—')}</span>
             ${segHtml}
-            <span class="score-pill" title="Weighted heuristic score · data confidence ${escapeHtml(r.scoring_confidence || '—')}">${Number(r.total_score).toFixed(1)}</span>
+            <span class="score-pill" title="GTM readiness (0.7·ship/monetise ease + 0.3·progress), not upside final_value · confidence ${escapeHtml(r.scoring_confidence || '—')}">${Number(r.total_score).toFixed(1)}</span>
             <span class="${moneyCls}" title="${escapeHtml(moneyTitle)}">${escapeHtml(bandLabel)}</span>
             <span class="path">${escapeHtml(r.path)}</span>
           </div>
@@ -2711,30 +2845,57 @@ def report_repo_plain_block(r: dict) -> list[str]:
         (r.get("demand_hint") or "").strip(),
         "",
         "SCORES (0-100 heuristic):",
-        f"  value                   {s.get('value')}",
+        f"  final_value (upside)    {s.get('value')}",
         f"  progress                {s.get('progress')}",
         f"  feature_potential       {s.get('feature_potential')}",
         f"  ship_monetise_ease      {s.get('effort_to_monetize')}",
-        f"  weighted_total           {r.get('total_score')}",
+        f"  gtm_readiness           {r.get('gtm_readiness', r.get('total_score'))}",
     ]
+    dg = (r.get("data_gap") or "").strip()
+    if dg:
+        lines.append(f"  {dg}")
+    rrk = r.get("risk_adjusted_rank")
+    if rrk is not None:
+        lines.append(f"  risk_adjusted_rank      {rrk}")
     sb = r.get("score_breakdown")
-    if isinstance(sb, dict) and sb:
+    if isinstance(sb, dict) and sb.get("schema") == "1.1":
+        dem = sb.get("demand") or {}
+        infra = sb.get("infra") or {}
         lines.extend(
             [
                 "",
-                "SCORE_BREAKDOWN (audit — scoring_guidance.md):",
-                f"  demand_pts={sb.get('demand_pts')} infra_pts={sb.get('infra_pts')} pain_pts={sb.get('pain_pts')}",
-                f"  stars_log={sb.get('stars_log')} npm_log={sb.get('npm_log')} demand_combined_100={sb.get('demand_combined_100')}",
-                f"  caps_applied: {', '.join(sb.get('caps_applied') or []) or '—'}",
-                f"  formula_note: {sb.get('formula', '')}",
+                "SCORE_BREAKDOWN (audit — Meta Cursor v1.1):",
+                f"  demand_pts: {sb.get('demand_pts')}",
+                f"    sources: {dem.get('sources')}",
+                f"    demand_source_used: {dem.get('demand_source_used')}",
+                f"    demand_combined_100: {dem.get('demand_combined_100')}",
+                f"    formula: {dem.get('formula')}",
+                f"  infra_pts: {sb.get('infra_pts')}",
+                f"    breakdown: {infra.get('breakdown')}",
+                f"    formula: {infra.get('formula')}",
             ]
         )
+        if sb.get("problem_evidence_pts"):
+            pe = sb.get("problem_evidence") or {}
+            lines.append(f"  problem_evidence_pts: {sb.get('problem_evidence_pts')}")
+            lines.append(f"    sources: {pe.get('sources')}")
+        lines.extend(
+            [
+                f"  base_value: {sb.get('base_value')}",
+                f"  recency_multiplier: {sb.get('recency_multiplier')} ({(sb.get('recency') or {}).get('reason')})",
+                f"  final_value: {sb.get('final_value')}",
+                f"  risk_flags: {', '.join(sb.get('risk_flags') or []) or '—'}",
+                f"  confidence: {sb.get('confidence')}",
+            ]
+        )
+    elif isinstance(sb, dict) and sb:
+        lines.extend(["", "SCORE_BREAKDOWN (legacy snapshot):", f"  {sb}"])
     lines.extend(
         [
             "",
-            "REVENUE BAND (illustrative, USD):",
+            "REVENUE_BAND (USD/year · P10 / P50 / P90):",
             (
-                f"  {int(r.get('money_usd_low')):,} — {int(r.get('money_usd_high')):,} / year"
+                f"  P10 {int(r.get('money_usd_low')):,} · P50 {int(r.get('money_usd_mid') or r.get('money_usd_low') or 0):,} · P90 {int(r.get('money_usd_high')):,}"
                 if r.get("money_usd_low") is not None and r.get("money_usd_high") is not None
                 else "  (not computed — rescan or reload index)"
             ),
@@ -2765,7 +2926,7 @@ def report_repo_plain_block(r: dict) -> list[str]:
 
 
 def build_report_bytes(fmt: str, subset: str, repos_in: list[dict]) -> tuple[bytes, str, str]:
-    sel = sorted(filter_repos_subset(repos_in, subset), key=lambda r: r.get("name", "").lower())
+    sel = sorted(filter_repos_subset(repos_in, subset), key=sort_key)
     subset_note = {"all": "All projects.", "past_metaai": "Lexical subset: repo name sorts after MetaAI."}.get(
         subset, subset
     )
@@ -2820,16 +2981,16 @@ def build_report_bytes(fmt: str, subset: str, repos_in: list[dict]) -> tuple[byt
                     "| metric | score |",
                     "| --- | ---: |",
                     f"| demand_evidence | {r.get('demand_evidence', '')} |",
-                    f"| value | {s.get('value')} |",
+                    f"| final_value | {s.get('value')} |",
                     f"| progress | {s.get('progress')} |",
                     f"| feature_potential | {s.get('feature_potential')} |",
                     f"| ship_ease | {s.get('effort_to_monetize')} |",
-                    f"| **total** | **{r.get('total_score')}** |",
+                    f"| **gtm_readiness** | **{r.get('total_score')}** |",
                     "",
-                    "### Revenue band (USD, illustrative)",
+                    "### Revenue band (USD/year — P10 / P50 / P90)",
                     "",
                     (
-                        f"{int(r.get('money_usd_low')):,} — {int(r.get('money_usd_high')):,} / year"
+                        f"P10 **{int(r.get('money_usd_low')):,}** · P50 **{int(r.get('money_usd_mid') or r.get('money_usd_low') or 0):,}** · P90 **{int(r.get('money_usd_high')):,}** / year"
                         if r.get("money_usd_low") is not None and r.get("money_usd_high") is not None
                         else "_(not computed — rescan or reload index)_"
                     ),

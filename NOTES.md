@@ -1,10 +1,20 @@
 # Projectscan scoring notes
 
-Update this file whenever **`WEIGHTS`** in `projectscan.py` or the demand / value caps in `_demand_evidence_points` / `analyze_repo` change materially (see `scoring_guidance.md` §7).
+Update this file when **`gtm_readiness`** weights, demand aggregation, infra breakdown rules, recency handling, or heuristic revenue (**P10/P50/P90**) defaults change — same commit as the code (Meta Cursor **v1.1** §8).
 
-## 2026-05-05
+The legacy weighted composite over **value / progress / feature_potential / effort_to_monetize** no longer drives **`total_score`**.
 
-- Demand blend when **both** GitHub stars and npm weekly resolve: **0.6 × stars_log + 0.4 × npm_log** (`scoring_guidance.md` §2); single-signal paths unchanged (stars-only or npm-only).
-- **`market_segment` / `market_segment_label`**: consumer Quest/home AR README signals map GAME repos to **mass_market_computer_game** (“Computer game for the masses”).
-- **`scoring_confidence`**, **`score_breakdown`** (demand audit + caps): `scoring_guidance.md` §6 / §6-style audit output.
-- Not implemented yet from `scoring_guidance.md`: full market/product/GTM composite, Monte Carlo revenue bands, negative signals, manual_notes parsers, risk-adjusted sort.
+## 2026-05-05 — Schema v1.1 (`Meta-Cursor-heuristic-algorythm-guidance.md`)
+
+- **Demand (0–50)**: single **best** resolved traction signal — `max` over per-channel `min(100, 20*log10(count+1))` for `stars`, `npm`, `pypi`, `waitlist` (missing legs are ignored, not averaged in as zero).
+- **`final_value`**: `min(100, round((demand + infra + problem_evidence) × recency_multiplier))` — **no legacy hard caps** (`game_cap29`, etc.). Risk is **`risk_flags`** (e.g. `HIT_DRIVEN_VOLATILITY`, `NO_MARKET_PULL`, `ABANDONMENT_RISK`).
+- **Infra**: auditable breakdown `{package, api_layout, docker, commits_gt_50, readme_licence}` summed and **capped at 35**.
+- **Problem evidence**: `manual_notes` regex (+ GitHub labelled issues **stub**, external mentions **stub**).
+- **`total_score` ≡ `gtm_readiness`**: **0.7 × ship_monetise_ease + 0.3 × progress** — separate from upside **`scores.value`**.
+- **Revenue**: **`money_usd_low` / `money_usd_mid` / `money_usd_high`** = **P10 / P50 / P90** with **`revenue_assumptions`** JSON for audit.
+- **Rank**: list sort by **`scores.value`** then confidence; **`risk_adjusted_rank`** orders by **`risk_adjusted_value`** (0.5× if `ABANDONMENT_RISK`).
+- Still TODO vs broader `scoring_guidance.md`: deeper Monte Carlo parameterisation, live GitHub issue labels, competitor density, full market/product/GTM composite.
+
+## Earlier (v1.0 snapshot)
+
+- Prior demand used **0.6/0.4** stars/npm blend when both resolved; v1.1 replaces that with **best-signal** semantics per Meta Cursor file pulled 2026-05-05.
