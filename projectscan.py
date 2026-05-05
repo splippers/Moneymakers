@@ -13,7 +13,11 @@ Usage:
   PROJECTSCAN_ROOT=/path/to/projects python3 projectscan.py serve
 
 Env overrides: ``PROJECTSCAN_ROOT``, ``PROJECTSCAN_INDEX_DIR``, ``PROJECTSCAN_PORT`` (serve),
-``PROJECTSCAN_PUBLIC_ORIGIN`` (e.g. ``http://192.168.1.2`` — full URL for the Drive setup guide link when nginx serves the portal at a LAN address).
+``PROJECTSCAN_PUBLIC_ORIGIN`` (e.g. ``http://192.168.1.2`` — full URL for the Drive setup guide link when nginx serves the portal at a LAN address),
+``PROJECTSCAN_EXTRA_ROOTS`` (comma-separated git repo paths to merge into the scan).
+
+This checkout (the directory containing ``projectscan.py``) is **always** scanned when it has a ``.git`` folder,
+so the Moneymakers / Projectscan repo appears in the dashboard even if ``PROJECTSCAN_ROOT`` points elsewhere.
 
 Google Drive (optional): ``pip install -r requirements-google.txt``, OAuth Desktop JSON as
 ``client_secrets.json`` in ``project_index`` (or ``PROJECTSCAN_DRIVE_CLIENT_SECRETS``). Run
@@ -645,8 +649,45 @@ def sort_key(repo: dict) -> tuple:
     return (hidden, -imp_n, -float(repo.get("total_score", 0)), repo.get("name", "").lower())
 
 
+def _scan_candidate_dirs(project_root: Path) -> list[Path]:
+    """Resolved git repo roots: children of project_root, this checkout, and PROJECTSCAN_EXTRA_ROOTS."""
+    by_resolved: dict[Path, Path] = {}
+
+    def consider(path: Path) -> None:
+        try:
+            p = path.expanduser().resolve()
+        except OSError:
+            return
+        if not p.is_dir() or not (p / ".git").exists():
+            return
+        key = p.resolve()
+        if key not in by_resolved:
+            by_resolved[key] = p
+
+    pr = project_root.expanduser().resolve()
+    if pr.is_dir():
+        try:
+            for item in sorted(pr.iterdir(), key=lambda x: x.name.lower()):
+                if item.is_dir():
+                    consider(item)
+        except OSError:
+            pass
+
+    consider(_script_dir())
+
+    raw = (os.environ.get("PROJECTSCAN_EXTRA_ROOTS") or "").strip()
+    if raw:
+        for part in raw.split(","):
+            part = part.strip()
+            if part:
+                consider(Path(part))
+
+    ordered = sorted(by_resolved.values(), key=lambda p: p.name.lower())
+    return ordered
+
+
 def scan_projects(root: Path | None = None) -> list[dict]:
-    """Find git repos directly under root, analyse, merge manual data, write index."""
+    """Collect git repos (see `_scan_candidate_dirs`), analyse, merge manual data, write index."""
     project_root = (root or projects_dir()).expanduser().resolve()
     idx = index_dir()
     idx.mkdir(parents=True, exist_ok=True)
@@ -665,13 +706,12 @@ def scan_projects(root: Path | None = None) -> list[dict]:
     repos: list[dict] = []
     if not project_root.is_dir():
         print(f"Warning: projects directory does not exist: {project_root}", file=sys.stderr)
-    else:
-        for item in sorted(project_root.iterdir(), key=lambda p: p.name.lower()):
-            if item.is_dir() and (item / ".git").exists():
-                print(f"Analysing {item.name}...")
-                repo = analyze_repo(item)
-                merge_persisted(repo, old_data.get(repo["name"]))
-                repos.append(repo)
+
+    for item in _scan_candidate_dirs(project_root):
+        print(f"Analysing {item.name}...")
+        repo = analyze_repo(item)
+        merge_persisted(repo, old_data.get(repo["name"]))
+        repos.append(repo)
 
     repos.sort(key=sort_key)
 
