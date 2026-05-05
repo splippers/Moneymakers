@@ -661,10 +661,50 @@ def _game_monetization_signals(repo_path: Path) -> bool:
     )
 
 
+def _signals_consumer_game_home_ar(name_lower: str, readme_lower: str, repo_path: Path) -> bool:
+    """Detect Quest/home AR/mass-market game scaffolding — never silently funnel these into B2B SaaS.
+
+    Uses README intent plus lightweight Unity/XR layout cues (Meta guidance: GAME beats speculative enterprise).
+    """
+    rl = readme_lower
+    blob = f"{name_lower}\n{rl}"
+
+    if re.search(r"\b(boredoom|chorewars|chore wars)\b", blob.replace("!", "").replace("'", "")):
+        return True
+
+    game_voice = bool(
+        re.search(r"\b(ar game|vr game|xr game|chore game|video game|players?\b|multiplayer\b)", rl)
+    )
+    mass_consumer_ar = bool(
+        re.search(
+            r"\b(meta quest|quest\s*[23]|quest pro|passthrough ar|home ar|living\s+room ar)\b",
+            rl,
+        )
+    )
+    if mass_consumer_ar and game_voice:
+        return True
+    if "openxr" in rl and game_voice:
+        return True
+    if re.search(r"\bpokemon go\b", rl):
+        return True
+
+    unity_consumer_shell = (
+        (repo_path / "Packages" / "manifest.json").is_file()
+        and (repo_path / "Assets").is_dir()
+    )
+    if unity_consumer_shell and mass_consumer_ar and (
+        re.search(r"\b(score|scoring|streak|unity)\b", rl) or re.search(r"\bchores?\b", rl)
+    ):
+        return True
+
+    return False
+
+
 def _infer_market_tag(
     repo_path: Path,
     name_lower: str,
     paths_lower: str,
+    readme_lower: str,
     *,
     has_package: bool,
     has_api: bool,
@@ -672,6 +712,8 @@ def _infer_market_tag(
     if re.search(r"\b(game|play|chore|fun)\b", name_lower):
         return "GAME"
     if name_lower == "ar" or name_lower.startswith("ar-"):
+        return "GAME"
+    if _signals_consumer_game_home_ar(name_lower, readme_lower, repo_path):
         return "GAME"
     if "/enterprise/" in paths_lower or re.search(r"\b(sso|saml|scim)\b", paths_lower):
         return "B2B_SAAS"
@@ -842,7 +884,14 @@ def analyze_repo(repo_path: Path) -> dict:
 
     stars = _lookup_github_stars(repo_path)
     npm_weekly = _npm_last_week_downloads(repo_path)
-    market_tag = _infer_market_tag(repo_path, name_lower, paths_lower, has_package=has_package, has_api=has_api)
+    market_tag = _infer_market_tag(
+        repo_path,
+        name_lower,
+        paths_lower,
+        readme_lower,
+        has_package=has_package,
+        has_api=has_api,
+    )
 
     demand_pts = _demand_evidence_points(stars=stars, npm_weekly=npm_weekly, market_tag=market_tag)
     infra_pts = _monetization_infra_points(repo_path, paths_lower)
