@@ -12,7 +12,7 @@ The legacy weighted composite over **value / progress / feature_potential / effo
 - **Problem evidence**: `manual_notes` regex (+ GitHub labelled issues **stub**, external mentions **stub**).
 - **`total_score` ≡ `gtm_readiness`**: **0.7 × ship_monetise_ease + 0.3 × progress** — separate from upside **`scores.value`**.
 - **Revenue**: **`money_usd_low` / `money_usd_mid` / `money_usd_high`** = **P10 / P50 / P90** with **`revenue_assumptions`** JSON for audit.
-- **Rank**: list sort by **`scores.value`** then confidence; **`risk_adjusted_rank`** orders by **`risk_adjusted_value`** (0.5× if `ABANDONMENT_RISK`).
+- **`repos.csv`** (index + dashboard save) and **Download report → CSV**: columns **`gtm_readiness`**, **`risk_adjusted_rank`**, **`money_usd_mid`** (P50 between **`money_usd_low`** / **`money_usd_high`** P10/P90). Report CSV assigns **`risk_adjusted_rank`** within the exported subset.
 - Still TODO vs broader `scoring_guidance.md`: deeper Monte Carlo parameterisation, live GitHub issue labels, competitor density, full market/product/GTM composite.
 
 ## Earlier (v1.0 snapshot)
