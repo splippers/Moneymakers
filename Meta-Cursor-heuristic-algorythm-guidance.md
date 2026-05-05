@@ -108,6 +108,8 @@ If Verdict = Kill, say why in 1 line. No sunk-cost cope.
 
 **Implemented in `projectscan.py`** (`analyze_repo` and helpers): demand-first `value` (0–100 with auto-cap at 40 when demand evidence is 0), `market_tag`, `demand_evidence` points (0–50 from GitHub stars / npm weekly downloads when discoverable), monetisation-infra detection via `git grep`, README “painkiller” keyword hints, GAME value cap (<30), devtool npm hobby cap, fixed **`feature_potential` = 20** when you are not logging validated user requests elsewhere, and **`effort_to_monetise`** mapped from payment/auth/pricing signals plus GAME monetisation hooks.
 
+The **portfolio value model** ties the same signals together: **`WEIGHTS`** emphasize `value` and `effort_to_monetize` over raw `progress`; **`estimate_money_usd`** blends `demand_evidence` and `market_tag` into illustrative bands; **`build_monetization`** / **`pick_roi_distribution`** bias playbook picks by tag (e.g. suppress faux-B2B enterprise GTM on `GAME`, boost founder-led / OSS paths on `INTERNAL_TOOL` / `DEVTOOL`).
+
 Set **`GITHUB_TOKEN`** (optional) if unauthenticated GitHub API rate limits star lookups during large scans.
 
 Architecture reminder (for agents editing scores manually):

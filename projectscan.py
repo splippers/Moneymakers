@@ -81,13 +81,12 @@ def index_file_json() -> Path:
 def index_file_csv() -> Path:
     return index_dir() / "repos.csv"
 
-# SCORING WEIGHTS — tweak to match what you care about most
+# Portfolio weights — Meta/Cursor rubric: demand and path-to-revenue dominate raw codebase bulk.
 WEIGHTS = {
-    "value": 0.35,
-    "progress": 0.25,
-    "feature_potential": 0.20,
-    # Higher = less remaining work to ship / monetise (was incorrectly inverted)
-    "effort_to_monetize": 0.20,
+    "value": 0.42,
+    "progress": 0.14,
+    "feature_potential": 0.12,
+    "effort_to_monetize": 0.32,
 }
 
 # Fields merged from previous JSON so annotations survive rescans
@@ -148,17 +147,46 @@ def total_score_for(scores: dict[str, int]) -> float:
     return round(sum(scores[k] * WEIGHTS[k] for k in WEIGHTS), 1)
 
 
-def estimate_money_usd(scores: dict[str, int]) -> tuple[int, int]:
-    """Illustrative yearly revenue band in USD from heuristic scores (not financial advice)."""
+def estimate_money_usd(
+    scores: dict[str, int],
+    *,
+    demand_evidence: int = 0,
+    market_tag: str = "INTERNAL_TOOL",
+) -> tuple[int, int]:
+    """Illustrative yearly revenue band in USD from heuristic scores (not financial advice).
+
+    Uses explicit demand_evidence (0–50) and market_tag so bands track provable traction,
+    not polish alone — aligned with Meta/Cursor guidance.md.
+    """
     v = scores["value"]
     prog = scores["progress"]
     fp = scores["feature_potential"]
     ef = scores["effort_to_monetize"]
-    composite = (v * 0.42 + prog * 0.22 + fp * 0.21 + ef * 0.15) / 100.0
-    composite = max(0.06, min(1.0, composite))
-    anchor = 4200 + (composite**1.52) * 480_000
-    wide = 1.75 + fp / 72.0 + (100 - prog) / 220.0
-    low = max(400, int(round(anchor * 0.55, -2)))
+    d = max(0, min(50, int(demand_evidence)))
+    demand_scaled = d * 2.0  # same 0–100 scale as other axes
+
+    composite = (
+        v * 0.34 + demand_scaled * 0.22 + prog * 0.11 + fp * 0.09 + ef * 0.24
+    ) / 100.0
+    composite = max(0.05, min(1.0, composite))
+
+    tag_scale = 1.0
+    if market_tag == "GAME":
+        tag_scale = 0.56
+    elif market_tag == "INTERNAL_TOOL":
+        tag_scale = 0.72
+    elif market_tag == "DEVTOOL":
+        tag_scale = 0.86 if d == 0 else 1.0
+    elif market_tag == "B2B_SAAS":
+        tag_scale = 1.04 if d > 0 else 0.90
+
+    anchor = (4200 + (composite**1.46) * 480_000) * tag_scale
+
+    wide = 1.62 + fp / 82.0 + (100 - prog) / 235.0
+    if d == 0:
+        wide += 0.18
+
+    low = max(400, int(round(anchor * 0.52, -2)))
     high = max(low + 2000, int(round(anchor * wide, -2)))
     low = min(low, 2_200_000)
     high = min(high, 5_000_000)
@@ -174,9 +202,38 @@ def build_monetization(
     has_docker: bool,
     has_api: bool,
     value: int,
+    market_tag: str = "INTERNAL_TOOL",
+    demand_evidence: int = 0,
 ) -> dict:
     """Concrete 'how money could be made' lines derived from repo signals."""
     paths: list[dict[str, str]] = []
+    tag = market_tag or "INTERNAL_TOOL"
+    d = max(0, min(50, int(demand_evidence)))
+
+    if tag == "GAME":
+        paths.extend(
+            [
+                {
+                    "title": "In-app purchases & cosmetics",
+                    "detail": "Battle passes, skins, season passes — align monetisation with retention curves (D1/D7/D30), not feature count.",
+                    "model": "GAME / IAP",
+                },
+                {
+                    "title": "Ads & rewarded formats",
+                    "detail": "Rewarded video / interstitials where session length supports it; hybrid IAP + ads common at scale.",
+                    "model": "GAME / ads",
+                },
+            ]
+        )
+    elif tag == "INTERNAL_TOOL":
+        paths.append(
+            {
+                "title": "Productize for a narrow ICP",
+                "detail": "Pick one external buyer persona, ship onboarding + billing; internal-only tools need deliberate productisation — code ≠ revenue.",
+                "model": "INTERNAL → SaaS",
+            }
+        )
+
     if has_api:
         paths.append(
             {
@@ -217,11 +274,11 @@ def build_monetization(
                 "model": "Founder-led sales",
             }
         )
-    if value >= 70:
+    if value >= 70 and (d >= 10 or tag == "B2B_SAAS"):
         paths.append(
             {
                 "title": "Partnership / white-label",
-                "detail": "Strong product signals; bundle into a larger vendor SKU or a reseller channel.",
+                "detail": "Strong product + traction signals; bundle into a larger vendor SKU or a reseller channel.",
                 "model": "Channel",
             }
         )
@@ -260,6 +317,8 @@ def pick_roi_distribution(
     progress: int,
     feature_potential: int,
     effort_to_monetize: int,
+    market_tag: str = "INTERNAL_TOOL",
+    demand_evidence: int = 0,
 ) -> dict[str, str | float]:
     """Single distribution path estimated to maximise ROI for these repo signals."""
     ctx = {
@@ -273,6 +332,8 @@ def pick_roi_distribution(
         "p": progress,
         "fp": feature_potential,
         "e": effort_to_monetize,
+        "tag": market_tag or "INTERNAL_TOOL",
+        "demand": max(0, min(50, int(demand_evidence))),
     }
 
     def plg_developer_score() -> float:
@@ -288,6 +349,14 @@ def pick_roi_distribution(
         if ctx["fc"] < 90:
             s += 10.0
         s += ctx["fp"] / 35.0
+        if ctx["tag"] == "GAME":
+            s *= 0.48
+        elif ctx["tag"] == "DEVTOOL":
+            s += 15.0
+        if ctx["demand"] >= 20:
+            s += 11.0
+        elif ctx["demand"] == 0:
+            s *= 0.86
         return s
 
     def enterprise_score() -> float:
@@ -302,6 +371,14 @@ def pick_roi_distribution(
             s += 22.0
         if ctx["e"] >= 62:
             s += 14.0
+        if ctx["tag"] == "GAME":
+            s *= 0.20
+        elif ctx["tag"] == "B2B_SAAS":
+            s += 17.0
+        elif ctx["tag"] == "INTERNAL_TOOL":
+            s *= 0.80
+        if ctx["demand"] == 0:
+            s *= 0.88
         return s
 
     def oss_flywheel_score() -> float:
@@ -316,6 +393,12 @@ def pick_roi_distribution(
             s += 14.0
         if not ctx["api"]:
             s += 6.0
+        if ctx["tag"] == "DEVTOOL":
+            s += 17.0
+        if ctx["tag"] == "GAME":
+            s += 8.0
+        if ctx["demand"] >= 15:
+            s += 8.0
         return s
 
     def founder_direct_score() -> float:
@@ -327,6 +410,12 @@ def pick_roi_distribution(
         s += max(0.0, 26.0 - ctx["v"] / 5.0)
         if ctx["readme"]:
             s += 8.0
+        if ctx["tag"] == "GAME":
+            s += 22.0
+        elif ctx["tag"] == "INTERNAL_TOOL":
+            s += 19.0
+        if ctx["demand"] == 0:
+            s += 6.0
         return s
 
     def partner_channel_score() -> float:
@@ -339,6 +428,16 @@ def pick_roi_distribution(
             s += 22.0
         if ctx["pkg"]:
             s += 12.0
+        if ctx["tag"] == "GAME":
+            s *= 0.52
+        elif ctx["tag"] == "B2B_SAAS":
+            s += 13.0
+        elif ctx["tag"] == "INTERNAL_TOOL":
+            s *= 0.84
+        if ctx["demand"] >= 18:
+            s += 14.0
+        elif ctx["demand"] == 0:
+            s *= 0.76
         return s
 
     playbooks = [
@@ -778,7 +877,7 @@ def analyze_repo(repo_path: Path) -> dict:
         "effort_to_monetize": effort_to_monetize,
     }
     total = total_score_for(scores)
-    lo, hi = estimate_money_usd(scores)
+    lo, hi = estimate_money_usd(scores, demand_evidence=demand_pts, market_tag=market_tag)
     monetization = build_monetization(
         file_count=file_count,
         has_readme=has_readme,
@@ -787,6 +886,8 @@ def analyze_repo(repo_path: Path) -> dict:
         has_docker=has_docker,
         has_api=has_api,
         value=value,
+        market_tag=market_tag,
+        demand_evidence=demand_pts,
     )
     distribution = pick_roi_distribution(
         file_count=file_count,
@@ -799,6 +900,8 @@ def analyze_repo(repo_path: Path) -> dict:
         progress=scores["progress"],
         feature_potential=scores["feature_potential"],
         effort_to_monetize=scores["effort_to_monetize"],
+        market_tag=market_tag,
+        demand_evidence=demand_pts,
     )
 
     demand_hint_parts: list[str] = []
@@ -847,6 +950,8 @@ def refresh_monetization_from_repo(repo: dict) -> None:
     scores = repo.get("scores")
     if not isinstance(scores, dict):
         return
+    tag = str(repo.get("market_tag") or "INTERNAL_TOOL")
+    dem = int(repo.get("demand_evidence") or 0)
     repo["monetization"] = build_monetization(
         file_count=int(repo.get("file_count") or 0),
         has_readme=bool(repo.get("has_readme")),
@@ -855,6 +960,8 @@ def refresh_monetization_from_repo(repo: dict) -> None:
         has_docker=bool(repo.get("has_docker")),
         has_api=bool(repo.get("has_api")),
         value=int(scores.get("value") or 0),
+        market_tag=tag,
+        demand_evidence=dem,
     )
     repo["roi_distribution"] = pick_roi_distribution(
         file_count=int(repo.get("file_count") or 0),
@@ -867,6 +974,8 @@ def refresh_monetization_from_repo(repo: dict) -> None:
         progress=int(scores.get("progress") or 0),
         feature_potential=int(scores.get("feature_potential") or 0),
         effort_to_monetize=int(scores.get("effort_to_monetize") or 0),
+        market_tag=tag,
+        demand_evidence=dem,
     )
 
 
@@ -875,7 +984,9 @@ def refresh_money_usd(repo: dict) -> None:
     scores = repo.get("scores")
     if not isinstance(scores, dict):
         return
-    auto_lo, auto_hi = estimate_money_usd(scores)
+    tag = str(repo.get("market_tag") or "INTERNAL_TOOL")
+    dem = int(repo.get("demand_evidence") or 0)
+    auto_lo, auto_hi = estimate_money_usd(scores, demand_evidence=dem, market_tag=tag)
     ml, mh = repo.get("manual_money_low"), repo.get("manual_money_high")
     if ml is not None and mh is not None:
         try:
