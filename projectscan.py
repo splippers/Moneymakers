@@ -214,13 +214,18 @@ def build_monetization(
         paths.extend(
             [
                 {
+                    "title": "Storefront & discovery (mass market)",
+                    "detail": "Quest / Horizon / App Lab positioning; trailers, ASO, and creator-led clips beat enterprise pilots — consumer AR wins on installs, retention, and seasonal beats.",
+                    "model": "GAME / mass market AR",
+                },
+                {
                     "title": "In-app purchases & cosmetics",
-                    "detail": "Battle passes, skins, season passes — align monetisation with retention curves (D1/D7/D30), not feature count.",
+                    "detail": "Battle passes, cosmetics, seasonal content — tune monetisation to D1/D7/D30 retention, not feature spreadsheets.",
                     "model": "GAME / IAP",
                 },
                 {
                     "title": "Ads & rewarded formats",
-                    "detail": "Rewarded video / interstitials where session length supports it; hybrid IAP + ads common at scale.",
+                    "detail": "Rewarded video / interstitials once sessions are long enough; hybrid IAP + ads is typical at consumer scale.",
                     "model": "GAME / ads",
                 },
             ]
@@ -234,7 +239,7 @@ def build_monetization(
             }
         )
 
-    if has_api:
+    if has_api and tag != "GAME":
         paths.append(
             {
                 "title": "Usage-based API",
@@ -242,7 +247,7 @@ def build_monetization(
                 "model": "B2B SaaS / devtools",
             }
         )
-    if has_package and not has_api:
+    if has_package and not has_api and tag != "GAME":
         paths.append(
             {
                 "title": "Library, CLI, or packaged tool",
@@ -250,7 +255,7 @@ def build_monetization(
                 "model": "License + support",
             }
         )
-    if has_docker:
+    if has_docker and tag != "GAME":
         paths.append(
             {
                 "title": "Hosted or on-prem deployment",
@@ -267,13 +272,22 @@ def build_monetization(
             }
         )
     if file_count < 35:
-        paths.append(
-            {
-                "title": "Early paid validation",
-                "detail": "Small codebase → ship a narrow paid MVP (lifetime deal, prepaid pilot) before broad features.",
-                "model": "Founder-led sales",
-            }
-        )
+        if tag == "GAME":
+            paths.append(
+                {
+                    "title": "Playtests & soft launch",
+                    "detail": "Store preview / sideload cohorts, Discord feedback, retention dashboards — prove fun and clarity before scaling paid UA.",
+                    "model": "GAME / growth",
+                }
+            )
+        else:
+            paths.append(
+                {
+                    "title": "Early paid validation",
+                    "detail": "Small codebase → ship a narrow paid MVP (lifetime deal, prepaid pilot) before broad features.",
+                    "model": "Founder-led sales",
+                }
+            )
     if value >= 70 and (d >= 10 or tag == "B2B_SAAS"):
         paths.append(
             {
@@ -282,13 +296,22 @@ def build_monetization(
                 "model": "Channel",
             }
         )
-    paths.append(
-        {
-            "title": "Services & integrations",
-            "detail": "Custom builds, onboarding, integrations — monetise depth while recurring product matures.",
-            "model": "Consulting funnel",
-        }
-    )
+    if tag == "GAME":
+        paths.append(
+            {
+                "title": "Community & UGC hooks",
+                "detail": "Leaderboards, shareable clips, seasonal modes — mass-market AR sustains on novelty loops and social proof, not bespoke integrations.",
+                "model": "GAME / community",
+            }
+        )
+    else:
+        paths.append(
+            {
+                "title": "Services & integrations",
+                "detail": "Custom builds, onboarding, integrations — monetise depth while recurring product matures.",
+                "model": "Consulting funnel",
+            }
+        )
     seen: set[str] = set()
     uniq: list[dict[str, str]] = []
     for p in paths:
@@ -297,7 +320,25 @@ def build_monetization(
             seen.add(k)
             uniq.append(p)
     models = sorted({p.get("model", "") for p in uniq if p.get("model")})
-    headline = ", ".join(models[:4]) if models else "Explore product-market fit first"
+    if tag == "GAME":
+        _game_h_order = (
+            "GAME / mass market AR",
+            "GAME / IAP",
+            "GAME / ads",
+            "GAME / growth",
+            "GAME / community",
+        )
+
+        def _game_headline_rank(m: str) -> tuple[int, str]:
+            try:
+                return (_game_h_order.index(m), m)
+            except ValueError:
+                return (len(_game_h_order), m)
+
+        models_for_headline = sorted(models, key=_game_headline_rank)
+    else:
+        models_for_headline = models
+    headline = ", ".join(models_for_headline[:4]) if models_for_headline else "Explore product-market fit first"
     return {
         "paths": uniq[:7],
         "models": models,
@@ -671,6 +712,17 @@ def _signals_consumer_game_home_ar(name_lower: str, readme_lower: str, repo_path
 
     if re.search(r"\b(boredoom|chorewars|chore wars)\b", blob.replace("!", "").replace("'", "")):
         return True
+
+    # Explicit consumer AR game positioning (README-first — folder names alone mislead).
+    if "augmented reality" in rl and re.search(r"\bgame\b|\bar\b|\bxr\b", rl):
+        return True
+    if re.search(r"\bar\s+chore\s+game\b|\b100%\s*ar\b.*\bgame\b|\bgame\b.*\b(meta\s+)?quest\b", rl, re.DOTALL):
+        return True
+    if "passthrough" in rl and re.search(r"\bgame\b|\bar\b", rl):
+        return True
+    if re.search(r"\b(mass[- ]market|for everyone|consumer\s+(?:vr|ar|title)|home\s+users)\b", rl):
+        if re.search(r"\bgame\b|\bar\b|\bquest\b|\bxr\b", rl):
+            return True
 
     game_voice = bool(
         re.search(r"\b(ar game|vr game|xr game|chore game|video game|players?\b|multiplayer\b)", rl)
