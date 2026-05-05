@@ -1528,6 +1528,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       border-color: rgba(232, 197, 71, 0.35);
     }
     .toolbar-main { flex: 8 1 340px; }
+    details.bells-panel {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: rgba(15, 18, 24, 0.65);
+      margin-bottom: 0.95rem;
+    }
+    details.bells-panel > summary {
+      cursor: pointer;
+      padding: 0.5rem 0.85rem;
+      font-size: 0.84rem;
+      font-weight: 600;
+      color: var(--muted);
+      list-style: none;
+      user-select: none;
+    }
+    details.bells-panel > summary::-webkit-details-marker { display: none; }
+    details.bells-panel[open] > summary {
+      color: var(--text);
+      border-bottom: 1px solid var(--border);
+    }
+    .bells-body {
+      padding: 0.85rem 0.95rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .bells-toggles { margin-bottom: 0; }
+    .intro-muted {
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin: 0 0 0.85rem;
+      line-height: 1.45;
+    }
     .toolbar-row {
       display: flex;
       flex-wrap: wrap;
@@ -1715,52 +1748,60 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="toolbar">
       <button type="button" class="primary" id="btnScan">Rescan projects</button>
-      <label class="pill"><input type="checkbox" id="showHidden" /> Show hidden</label>
     </div>
   </header>
   <main>
     <p id="msg"></p>
-    <p class="disc">Rough <strong>annual revenue bands</strong> derive from heuristic scores and repo layout (illustrative only, not advice). Bands are stored in <strong>USD</strong>; display defaults to <strong>GBP</strong> via <code>open.er-api.com</code> (static fallback offline). Highest-ROI paths are playbook picks from repo signals. Google Drive uploads: <a class="portal-guide" href="@@DRIVE_GUIDE_HREF@@">setup guide</a>@@DRIVE_GUIDE_HINT@@</p>
-    <div class="toolbar-row">
-      <div class="field mini-field">
-        <label>Sort by</label>
-        <select id="sortBy">
-          <option value="importance_score">Importance · heuristic score</option>
-          <option value="money_high">Revenue band (high end)</option>
-          <option value="money_low">Revenue band (low end)</option>
-          <option value="total_score">Heuristic score only</option>
-          <option value="value_bar">Value bar</option>
-          <option value="progress">Progress bar</option>
-          <option value="name">Name A–Z</option>
-        </select>
+    <p class="intro-muted">Heuristic prioritisation and illustrative USD bands — open <strong>Bells &amp; whistles</strong> for sorting, currency, exports, and Drive.</p>
+    <details class="bells-panel" id="bellsPanel">
+      <summary>Bells &amp; whistles · sorting, currency, reports, Drive</summary>
+      <div class="bells-body">
+        <p class="disc" style="margin:0">Rough <strong>annual revenue bands</strong> derive from heuristic scores and repo layout (illustrative only, not advice). Bands are stored in <strong>USD</strong>; display currency uses <code>open.er-api.com</code> (static fallback offline). Highest-ROI paths are playbook picks from repo signals. Google Drive uploads: <a class="portal-guide" href="@@DRIVE_GUIDE_HREF@@">setup guide</a>@@DRIVE_GUIDE_HINT@@</p>
+        <div class="bells-toggles">
+          <label class="pill"><input type="checkbox" id="showHidden" /> Show hidden projects</label>
+        </div>
+        <div class="toolbar-row">
+          <div class="field mini-field">
+            <label>Sort by</label>
+            <select id="sortBy">
+              <option value="importance_score">Importance · heuristic score</option>
+              <option value="money_high">Revenue band (high end)</option>
+              <option value="money_low">Revenue band (low end)</option>
+              <option value="total_score">Heuristic score only</option>
+              <option value="value_bar">Value bar</option>
+              <option value="progress">Progress bar</option>
+              <option value="name">Name A–Z</option>
+            </select>
+          </div>
+          <div class="field mini-field">
+            <label>Display currency</label>
+            <select id="fxCurrency"><option value="GBP">GBP</option></select>
+          </div>
+          <span class="meta" id="fxMeta" style="align-self:center;font-size:.8rem;color:var(--muted);margin-left:auto;"></span>
+        </div>
+        <div class="toolbar-row drive-upload-row">
+          <div class="field mini-field">
+            <label>Report format</label>
+            <select id="reportFormat" title="File format (download &amp; Drive upload)">
+              <option value="txt">Plain text (.txt)</option>
+              <option value="md">Markdown (.md)</option>
+              <option value="csv">Spreadsheet (.csv)</option>
+              <option value="json">JSON</option>
+            </select>
+          </div>
+          <div class="field mini-field">
+            <label>Report subset</label>
+            <select id="reportSubset" title="Which repos to include">
+              <option value="all">All projects</option>
+              <option value="past_metaai">Name lexically after &quot;MetaAI&quot;</option>
+            </select>
+          </div>
+          <button type="button" id="btnDownloadReport" title="Save locally, then drag into Drive in a browser">Download report</button>
+          <button type="button" class="primary" id="btnDriveUpload">Upload to Google Drive</button>
+          <span class="meta" id="driveStatusLine" style="align-self:center;font-size:0.8rem;color:var(--muted);flex:1;min-width:12rem"></span>
+        </div>
       </div>
-      <div class="field mini-field">
-        <label>Display currency</label>
-        <select id="fxCurrency"><option value="GBP">GBP</option></select>
-      </div>
-      <span class="meta" id="fxMeta" style="align-self:center;font-size:.8rem;color:var(--muted);margin-left:auto;"></span>
-    </div>
-    <div class="toolbar-row drive-upload-row">
-      <div class="field mini-field">
-        <label>Report format</label>
-        <select id="reportFormat" title="File format (download &amp; Drive upload)">
-          <option value="txt">Plain text (.txt)</option>
-          <option value="md">Markdown (.md)</option>
-          <option value="csv">Spreadsheet (.csv)</option>
-          <option value="json">JSON</option>
-        </select>
-      </div>
-      <div class="field mini-field">
-        <label>Report subset</label>
-        <select id="reportSubset" title="Which repos to include">
-          <option value="all">All projects</option>
-          <option value="past_metaai">Name lexically after &quot;MetaAI&quot;</option>
-        </select>
-      </div>
-      <button type="button" id="btnDownloadReport" title="Save locally, then drag into Drive in a browser">Download report</button>
-      <button type="button" class="primary" id="btnDriveUpload">Upload to Google Drive</button>
-      <span class="meta" id="driveStatusLine" style="align-self:center;font-size:0.8rem;color:var(--muted);flex:1;min-width:12rem"></span>
-    </div>
+    </details>
     <div class="stats" id="stats"></div>
     <div class="cards" id="cards"></div>
   </main>
@@ -1770,6 +1811,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const toast = $('toast');
     const LS_CCY = 'projectscan_display_ccy';
     const LS_SORT = 'projectscan_sort_key';
+    const LS_BELLS = 'projectscan_bells_open';
     const DEFAULT_CCY = 'GBP';
     let fxPayload = null;
     let reposCache = [];
@@ -2228,6 +2270,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         b.disabled = false;
       }
     });
+    const bellsPanel = $('bellsPanel');
+    if (bellsPanel && localStorage.getItem(LS_BELLS) === '1') bellsPanel.open = true;
+    if (bellsPanel) {
+      bellsPanel.addEventListener('toggle', () => {
+        localStorage.setItem(LS_BELLS, bellsPanel.open ? '1' : '0');
+      });
+    }
     load();
   </script>
 </body>
