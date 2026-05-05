@@ -57,7 +57,7 @@ Interactive GCP / Workspace URL walkthrough (mobile-friendly):
 | `Meta-Cursor-heuristic-algorythm-guidance.md` | Scoring rubric notes for agents / Cursor |
 | `project_index/` | Local-only: scan results (`repos.json`, `repos.csv`) and OAuth secrets — not tracked in git |
 
-Environment variables are documented in the docstrings at the top of `projectscan.py`. Notable extras: **`PROJECTSCAN_EXTRA_ROOTS`** — comma-separated paths of additional git repos to merge into one scan — and the repo that contains **`projectscan.py`** is always included when it has a **`.git`** directory (so this tool scores itself even if **`PROJECTSCAN_ROOT`** points at another tree).
+Environment variables are documented in the docstrings at the top of `projectscan.py`. Notable extras: **`PROJECTSCAN_EXTRA_ROOTS`** — comma-separated paths of additional git repos to merge into one scan — and the repo that contains **`projectscan.py`** is always included when it has a **`.git`** directory (so this tool scores itself even if **`PROJECTSCAN_ROOT`** points at another tree). Optional **`GITHUB_TOKEN`** improves GitHub API rate limits when resolving star counts for demand signals.
 
 ## Licence
 

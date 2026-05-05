@@ -106,27 +106,14 @@ If Verdict = Kill, say why in 1 line. No sunk-cost cope.
 
 ## 9. Code Integration Notes
 
-Add this comment to the top of `analyze_repo()` in project_scorer.py:
+**Implemented in `projectscan.py`** (`analyze_repo` and helpers): demand-first `value` (0–100 with auto-cap at 40 when demand evidence is 0), `market_tag`, `demand_evidence` points (0–50 from GitHub stars / npm weekly downloads when discoverable), monetisation-infra detection via `git grep`, README “painkiller” keyword hints, GAME value cap (<30), devtool npm hobby cap, fixed **`feature_potential` = 20** when you are not logging validated user requests elsewhere, and **`effort_to_monetise`** mapped from payment/auth/pricing signals plus GAME monetisation hooks.
+
+Set **`GITHUB_TOKEN`** (optional) if unauthenticated GitHub API rate limits star lookups during large scans.
+
+Architecture reminder (for agents editing scores manually):
+
 ```
-# Before scoring, read HEURISTICS.md and apply Market Fit Taxonomy.
-# Default GAME projects to market_tag='GAME'. Never suggest B2B without evidence.
+# Before overriding scores, read this doc — assign market_tag first.
+# Default GAME when name matches game/play/chore/fun/AR. Never B2B_SAAS without evidence.
 # Cap value at 40 if demand_evidence = 0.
-```
-
-Example heuristics to add in code:
-```
-has_stripe = run_git_command(repo_path, ["grep", "-ri", "stripe"]) != ""
-has_auth = any((repo_path / f).exists() for f in ["auth.ts", "clerk", "auth0"])
-has_billing_file = (repo_path / "billing").exists() or (repo_path / "pricing.md").exists()
-```
-
-Example market tag detection:
-```
-name_lower = repo_path.name.lower()
-if any(k in name_lower for k in ["game", "ar", "chore", "play"]):
-    market_tag = "GAME"
-elif (repo_path / "sso").exists() or (repo_path / "saml").exists():
-    market_tag = "B2B_SAAS"
-else:
-    market_tag = "INTERNAL_TOOL"
 ```

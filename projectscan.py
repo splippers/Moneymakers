@@ -15,6 +15,7 @@ Usage:
 Env overrides: ``PROJECTSCAN_ROOT``, ``PROJECTSCAN_INDEX_DIR``, ``PROJECTSCAN_PORT`` (serve),
 ``PROJECTSCAN_PUBLIC_ORIGIN`` (e.g. ``http://192.168.1.2`` — full URL for the Drive setup guide link when nginx serves the portal at a LAN address),
 ``PROJECTSCAN_EXTRA_ROOTS`` (comma-separated git repo paths to merge into the scan).
+Optional: ``GITHUB_TOKEN`` raises GitHub API rate limits when resolving star counts for demand signals.
 
 This checkout (the directory containing ``projectscan.py``) is **always** scanned when it has a ``.git`` folder,
 so the Moneymakers / Projectscan repo appears in the dashboard even if ``PROJECTSCAN_ROOT`` points elsewhere.
@@ -41,6 +42,7 @@ import html
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -50,7 +52,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 def _script_dir() -> Path:
@@ -120,6 +122,9 @@ FX_FALLBACK_RATES_FROM_USD: dict[str, float] = {
     "PLN": 4.0,
     "MXN": 17.5,
 }
+
+# Successful lookups only — avoids caching transient GitHub API failures.
+_GITHUB_STARS_CACHE: dict[str, int] = {}
 
 
 def run_git_command(repo_path: Path, cmd: list[str]) -> str:
@@ -417,9 +422,296 @@ def pick_roi_distribution(
     }
 
 
+def _readme_preview(repo_path: Path) -> str:
+    for fname in ("README.md", "readme.md"):
+        p = repo_path / fname
+        if p.is_file():
+            try:
+                return p.read_text(encoding="utf-8", errors="ignore")[:26000]
+            except OSError:
+                break
+    return ""
+
+
+def _tracked_paths_blob(repo_path: Path) -> str:
+    ls = run_git_command(repo_path, ["ls-files"])
+    return "\n".join(ls.splitlines()).lower()
+
+
+def _git_grep_regex(repo_path: Path, pattern: str) -> bool:
+    cmd = ["git", "-C", str(repo_path), "grep", "-l", "-I", "-E", pattern, "--"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=18)
+        return r.returncode == 0 and bool((r.stdout or "").strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _parse_github_owner_repo(remote_line: str) -> tuple[str, str] | None:
+    u = remote_line.strip()
+    if not u:
+        return None
+    m = re.search(r"github\.com[:/]([^/]+)/([^/\s#]+)", u)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2).removesuffix(".git")
+    return (owner, repo) if owner and repo else None
+
+
+def _lookup_github_stars(repo_path: Path) -> int | None:
+    remote = run_git_command(repo_path, ["remote", "get-url", "origin"])
+    coord = _parse_github_owner_repo(remote)
+    if not coord:
+        return None
+    owner, repo = coord
+    key = f"{owner.lower()}/{repo.lower()}"
+    if key in _GITHUB_STARS_CACHE:
+        return _GITHUB_STARS_CACHE[key]
+    token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    url = f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "projectscan-moneymakers",
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=14) as resp:
+            payload = json.loads(resp.read().decode())
+        stars = int(payload.get("stargazers_count", 0))
+        _GITHUB_STARS_CACHE[key] = stars
+        return stars
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _npm_last_week_downloads(repo_path: Path) -> int | None:
+    pj = repo_path / "package.json"
+    if not pj.is_file():
+        return None
+    try:
+        data = json.loads(pj.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw_name = data.get("name")
+    if not isinstance(raw_name, str):
+        return None
+    pkg = raw_name.strip()
+    if not pkg:
+        return None
+    enc = quote(pkg, safe="@/")
+    url = f"https://api.npmjs.org/downloads/point/last-week/{enc}"
+    req = urllib.request.Request(url, headers={"User-Agent": "projectscan-moneymakers"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = json.loads(resp.read().decode())
+        n = body.get("downloads")
+        return int(n) if isinstance(n, int) else None
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _payment_code_present(repo_path: Path) -> bool:
+    return _git_grep_regex(
+        repo_path,
+        r"Stripe|stripe\.com|Paddle|LemonSqueezy|lemonsqueezy|checkout\.sessions|BillingPortal",
+    )
+
+
+def _has_auth_signals(paths_lower: str, repo_path: Path) -> bool:
+    needles = (
+        "/auth/",
+        "/oauth/",
+        "/sso/",
+        "/saml/",
+        "auth.ts",
+        "auth.tsx",
+        "middleware.ts",
+        "clerk",
+        "auth0",
+        "next-auth",
+        "better-auth",
+        "/supabase/",
+    )
+    if any(n in paths_lower for n in needles):
+        return True
+    return _git_grep_regex(
+        repo_path,
+        r"ClerkProvider|NextAuth|Auth0|better-auth|firebase-admin|passport\.authenticate",
+    )
+
+
+def _has_pricing_surface(paths_lower: str) -> bool:
+    return bool(
+        "pricing.md" in paths_lower
+        or "/pricing/" in paths_lower
+        or "/pricing'" in paths_lower
+        or '/pricing"' in paths_lower
+        or "routes/pricing" in paths_lower
+        or "pages/pricing" in paths_lower
+        or "app/pricing" in paths_lower
+    )
+
+
+def _game_monetization_signals(repo_path: Path) -> bool:
+    return _git_grep_regex(
+        repo_path,
+        r"in-app purchase|in_app_purchase|AdMob|admob|UnityAds|unity.?ads|\biap\b|battle pass|cosmetic shop",
+    )
+
+
+def _infer_market_tag(
+    repo_path: Path,
+    name_lower: str,
+    paths_lower: str,
+    *,
+    has_package: bool,
+    has_api: bool,
+) -> str:
+    if re.search(r"\b(game|play|chore|fun)\b", name_lower):
+        return "GAME"
+    if name_lower == "ar" or name_lower.startswith("ar-"):
+        return "GAME"
+    if "/enterprise/" in paths_lower or re.search(r"\b(sso|saml|scim)\b", paths_lower):
+        return "B2B_SAAS"
+    if _has_pricing_surface(paths_lower) and (
+        has_api
+        or "tenant" in paths_lower
+        or "organisation" in paths_lower
+        or "organization" in paths_lower
+    ):
+        return "B2B_SAAS"
+    if has_package and (has_api or "sdk" in paths_lower or "/cli/" in paths_lower or "/cmd/" in paths_lower):
+        return "DEVTOOL"
+    if has_package:
+        return "DEVTOOL"
+    if has_api:
+        return "B2B_SAAS"
+    return "INTERNAL_TOOL"
+
+
+def _painkiller_points(readme_lower: str) -> int:
+    strong = (
+        "gdpr",
+        "hipaa",
+        "pci-dss",
+        "soc 2",
+        "payroll",
+        "invoice fraud",
+        "ransomware",
+        "disaster recovery",
+        "data breach",
+        "money laundering",
+        "tax filing",
+        "compliance audit",
+    )
+    medium = (
+        "sso",
+        "audit log",
+        "encryption at rest",
+        "backup",
+        "billing dispute",
+        "subscription billing",
+    )
+    s_hit = sum(1 for k in strong if k in readme_lower)
+    m_hit = sum(1 for k in medium if k in readme_lower)
+    if s_hit >= 2:
+        return 20
+    if s_hit == 1:
+        return 16
+    if m_hit >= 2:
+        return 10
+    if m_hit == 1:
+        return 6
+    if len(readme_lower) > 800:
+        return 5
+    return 0
+
+
+def _monetization_infra_points(repo_path: Path, paths_lower: str) -> int:
+    pay = _payment_code_present(repo_path)
+    auth = _has_auth_signals(paths_lower, repo_path)
+    price = _has_pricing_surface(paths_lower)
+    pts = 15 if pay else 0
+    pts += 10 if auth else 0
+    pts += 5 if price else 0
+    return min(30, pts)
+
+
+def _demand_evidence_points(
+    *,
+    stars: int | None,
+    npm_weekly: int | None,
+    market_tag: str,
+) -> int:
+    pts = 0
+    if stars is not None and stars > 50:
+        pts += 20
+    elif stars is not None and stars > 15:
+        pts += 10
+    npm_pts = 0
+    if npm_weekly is not None and npm_weekly >= 500:
+        npm_pts = 20
+    elif npm_weekly is not None and npm_weekly >= 100:
+        npm_pts = 10
+    if market_tag == "DEVTOOL" and npm_weekly is not None and npm_weekly < 100:
+        npm_pts = min(npm_pts, 5)
+    pts += npm_pts
+    return min(50, pts)
+
+
+def _effort_to_monetize_score(
+    *,
+    market_tag: str,
+    repo_path: Path,
+    paths_lower: str,
+    has_readme: bool,
+    has_license: bool,
+    has_package: bool,
+    has_docker: bool,
+    progress: int,
+) -> int:
+    pay = _payment_code_present(repo_path)
+    auth = _has_auth_signals(paths_lower, repo_path)
+    price = _has_pricing_surface(paths_lower)
+    ease = 28
+    if pay and price and auth:
+        ease = max(ease, 98)
+    elif pay and price:
+        ease = max(ease, 88)
+    elif pay and auth:
+        ease = max(ease, 82)
+    elif pay:
+        ease = max(ease, 74)
+    elif price:
+        ease = max(ease, 62)
+    elif has_readme and has_license and has_package:
+        ease = max(ease, 52)
+    elif has_readme and has_package:
+        ease = max(ease, 46)
+    elif has_readme:
+        ease = max(ease, 38)
+    ease += min(12, progress // 10)
+    if has_docker:
+        ease += 4
+    if market_tag == "GAME":
+        if _game_monetization_signals(repo_path):
+            ease = max(ease, 56)
+        else:
+            ease = min(ease, 32)
+    return max(10, min(100, ease))
+
+
 def analyze_repo(repo_path: Path) -> dict:
-    """Extract metrics and heuristic scores for a single repo."""
+    """Extract metrics and heuristic scores for a single repo.
+
+    Implements the demand-first rubric in ``Meta-Cursor-heuristic-algorythm-guidance.md``
+    using observable repo signals (GitHub stars, npm downloads, payment/auth/pricing code).
+    """
     name = repo_path.name
+    name_lower = name.lower()
 
     last_commit = run_git_command(repo_path, ["log", "-1", "--format=%cr"])
     commit_raw = run_git_command(repo_path, ["rev-list", "--count", "HEAD"])
@@ -430,8 +722,11 @@ def analyze_repo(repo_path: Path) -> dict:
 
     ls = run_git_command(repo_path, ["ls-files"])
     file_count = len(ls.splitlines()) if ls else 0
+    paths_lower = _tracked_paths_blob(repo_path)
+    readme_raw = _readme_preview(repo_path)
+    readme_lower = readme_raw.lower()
 
-    has_readme = (repo_path / "README.md").exists() or (repo_path / "readme.md").exists()
+    has_readme = bool(readme_raw.strip()) or (repo_path / "readme.md").exists()
     has_license = any((repo_path / f).exists() for f in ("LICENSE", "LICENSE.md"))
     has_package = any(
         (repo_path / f).exists() for f in ("package.json", "pyproject.toml", "Cargo.toml", "go.mod")
@@ -446,22 +741,35 @@ def analyze_repo(repo_path: Path) -> dict:
         progress += 10
     progress = min(100, progress)
 
-    value = 20
-    if has_api:
-        value += 30
-    if file_count > 50:
-        value += 20
-    if has_readme and has_license:
-        value += 15
-    value = min(100, value)
+    stars = _lookup_github_stars(repo_path)
+    npm_weekly = _npm_last_week_downloads(repo_path)
+    market_tag = _infer_market_tag(repo_path, name_lower, paths_lower, has_package=has_package, has_api=has_api)
 
-    feature_potential = 50
-    if file_count < 20:
-        feature_potential = 80
-    if "todo" in name.lower():
-        feature_potential = 90
+    demand_pts = _demand_evidence_points(stars=stars, npm_weekly=npm_weekly, market_tag=market_tag)
+    infra_pts = _monetization_infra_points(repo_path, paths_lower)
+    pain_pts = _painkiller_points(readme_lower)
 
-    effort_to_monetize = min(100, progress + (8 if has_package else 0) + (5 if has_docker else 0))
+    value = min(100, demand_pts + infra_pts + pain_pts)
+    if demand_pts == 0:
+        value = min(value, 40)
+    if market_tag == "GAME":
+        value = min(value, 29)
+    if market_tag == "DEVTOOL" and npm_weekly is not None and npm_weekly < 100:
+        if stars is None or stars <= 50:
+            value = min(value, 38)
+
+    feature_potential = 20
+
+    effort_to_monetize = _effort_to_monetize_score(
+        market_tag=market_tag,
+        repo_path=repo_path,
+        paths_lower=paths_lower,
+        has_readme=has_readme,
+        has_license=has_license,
+        has_package=has_package,
+        has_docker=has_docker,
+        progress=progress,
+    )
 
     scores = {
         "value": value,
@@ -493,9 +801,20 @@ def analyze_repo(repo_path: Path) -> dict:
         effort_to_monetize=scores["effort_to_monetize"],
     )
 
+    demand_hint_parts: list[str] = []
+    if stars is not None:
+        demand_hint_parts.append(f"GitHub ★ {stars}")
+    else:
+        demand_hint_parts.append("GitHub stars unknown (private host or API miss)")
+    if npm_weekly is not None:
+        demand_hint_parts.append(f"npm last-week ≈ {npm_weekly}")
+    demand_hint = "Demand signals: " + " · ".join(demand_hint_parts)
+
     return {
         "name": name,
         "path": str(repo_path.resolve()),
+        "market_tag": market_tag,
+        "demand_evidence": demand_pts,
         "last_commit": last_commit,
         "commit_count": commit_count,
         "file_count": file_count,
@@ -515,6 +834,7 @@ def analyze_repo(repo_path: Path) -> dict:
         "money_usd_high": hi,
         "monetization": monetization,
         "roi_distribution": distribution,
+        "demand_hint": demand_hint,
         "importance": 3,
         "status": "active",
         "hidden": False,
@@ -724,6 +1044,8 @@ def scan_projects(root: Path | None = None) -> list[dict]:
         writer.writerow(
             [
                 "name",
+                "market_tag",
+                "demand_evidence",
                 "total_score",
                 "value",
                 "progress",
@@ -752,6 +1074,8 @@ def scan_projects(root: Path | None = None) -> list[dict]:
             writer.writerow(
                 [
                     r["name"],
+                    r.get("market_tag", ""),
+                    r.get("demand_evidence", ""),
                     r["total_score"],
                     s["value"],
                     s["progress"],
@@ -814,6 +1138,8 @@ def save_repos(repos: list[dict]) -> None:
         writer.writerow(
             [
                 "name",
+                "market_tag",
+                "demand_evidence",
                 "total_score",
                 "value",
                 "progress",
@@ -842,6 +1168,8 @@ def save_repos(repos: list[dict]) -> None:
             writer.writerow(
                 [
                     r["name"],
+                    r.get("market_tag", ""),
+                    r.get("demand_evidence", ""),
                     r["total_score"],
                     s["value"],
                     s["progress"],
@@ -1206,6 +1534,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     a.portal-guide:hover { text-decoration: underline; }
     .guide-origin { font-size: 0.78rem; color: var(--muted); }
     .guide-origin code { font-size: 0.88em; color: var(--muted); }
+    .market-tag {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--accent);
+      border: 1px solid var(--border);
+      padding: 0.12rem 0.45rem;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -1410,9 +1749,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function escapeHtml(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
-    function bar(label, value) {
+    function bar(label, value, title) {
       const v = Math.max(0, Math.min(100, Number(value) || 0));
-      return `<div class="bar-row"><span class="label">${label}</span><div class="bar-track"><div class="bar-fill" style="width:${v}%"></div></div><span class="num">${v}</span></div>`;
+      const t = title ? ` title="${escapeHtml(title)}"` : '';
+      return `<div class="bar-row"${t}><span class="label">${label}</span><div class="bar-track"><div class="bar-fill" style="width:${v}%"></div></div><span class="num">${v}</span></div>`;
     }
     function monetPathsHtml(mon) {
       const paths = mon && Array.isArray(mon.paths) ? mon.paths : [];
@@ -1485,6 +1825,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         return `<article class="card ${hidCls}" data-name="${escapeHtml(r.name)}">
           <div class="top">
             <h2>${escapeHtml(r.name)}</h2>
+            <span class="market-tag" title="Heuristic market tag (Meta/Cursor taxonomy)">${escapeHtml(r.market_tag || '—')}</span>
             <span class="score-pill" title="Weighted heuristic score">${Number(r.total_score).toFixed(1)}</span>
             <span class="${moneyCls}" title="${escapeHtml(moneyTitle)}">${escapeHtml(bandLabel)}</span>
             <span class="path">${escapeHtml(r.path)}</span>
@@ -1506,7 +1847,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
           <div class="bars">
-            ${bar('Value', s.value)}
+            ${bar('Value', s.value, r.demand_hint || '')}
             ${bar('Progress', s.progress)}
             ${bar('Feature potential', s.feature_potential)}
             ${bar('Ship / monetise ease', s.effort_to_monetize)}
@@ -1970,6 +2311,8 @@ def report_repo_plain_block(r: dict) -> list[str]:
             f" package={r.get('has_package')} api_layout={r.get('has_api')}"
             f" docker={r.get('has_docker')}"
         ),
+        f"TAXONOMY: market_tag={r.get('market_tag', '?')} demand_evidence_pts={r.get('demand_evidence', '?')}",
+        (r.get("demand_hint") or "").strip(),
         "",
         "SCORES (0-100 heuristic):",
         f"  value                   {s.get('value')}",
@@ -2057,11 +2400,13 @@ def build_report_bytes(fmt: str, subset: str, repos_in: list[dict]) -> tuple[byt
                     f"## {r.get('name', '?')}",
                     "",
                     f"- Path: `{r.get('path')}`",
+                    f"- Market tag: `{r.get('market_tag', '—')}` · demand evidence (auto): **{r.get('demand_evidence', '—')}**/50",
                     f"- Signals: readme={r.get('has_readme')} lic={r.get('has_license')}"
                     f" pkg={r.get('has_package')} api={r.get('has_api')} docker={r.get('has_docker')}",
                     "",
                     "| metric | score |",
                     "| --- | ---: |",
+                    f"| demand_evidence | {r.get('demand_evidence', '')} |",
                     f"| value | {s.get('value')} |",
                     f"| progress | {s.get('progress')} |",
                     f"| feature_potential | {s.get('feature_potential')} |",
@@ -2113,6 +2458,8 @@ def build_report_bytes(fmt: str, subset: str, repos_in: list[dict]) -> tuple[byt
         w.writerow(
             [
                 "name",
+                "market_tag",
+                "demand_evidence",
                 "total_score",
                 "value",
                 "progress",
@@ -2137,6 +2484,8 @@ def build_report_bytes(fmt: str, subset: str, repos_in: list[dict]) -> tuple[byt
             w.writerow(
                 [
                     r.get("name"),
+                    r.get("market_tag", ""),
+                    r.get("demand_evidence", ""),
                     r.get("total_score"),
                     s.get("value"),
                     s.get("progress"),
