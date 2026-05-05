@@ -29,6 +29,9 @@ Over SSH, use ``--oauth-port 9876`` (or ``$PROJECTSCAN_DRIVE_OAUTH_PORT``) and m
 
 Workspace + GCP step-by-step (URLs for mobile copy/paste): ``./drive_workspace_setup_wizard.py``.
 
+Heuristic scoring changelog and audit expectations (demand curve, confidence tier, ``SCORE_BREAKDOWN``):
+see ``scoring_guidance.md`` and ``NOTES.md``.
+
 Restrict which Google login may upload: ``PROJECTSCAN_DRIVE_ALLOWED_EMAILS=jon@splippers.com`` (comma-separated).
 With an **Internal** OAuth consent screen (Google Workspace), only organisational accounts can consent; with
 **External** apps in **Testing** mode, add Google’s **test users** list as well.
@@ -41,6 +44,7 @@ import csv
 import html
 import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -724,6 +728,12 @@ def _signals_consumer_game_home_ar(name_lower: str, readme_lower: str, repo_path
         if re.search(r"\bgame\b|\bar\b|\bquest\b|\bxr\b", rl):
             return True
 
+    if re.search(r"\bcomputer\s+game\b", rl) and re.search(
+        r"\b(mass|masses|everyone|consumer|players?\b|home\s+users?\b)\b",
+        rl,
+    ):
+        return True
+
     game_voice = bool(
         re.search(r"\b(ar game|vr game|xr game|chore game|video game|players?\b|multiplayer\b)", rl)
     )
@@ -833,26 +843,86 @@ def _monetization_infra_points(repo_path: Path, paths_lower: str) -> int:
     return min(30, pts)
 
 
+def _stars_log_norm(stars: int) -> float:
+    """0–100 curve per scoring_guidance.md: min(100, 20 * log10(stars + 1))."""
+    return min(100.0, 20.0 * math.log10(max(stars, 0) + 1))
+
+
+def _npm_log_norm(npm_weekly: int) -> float:
+    """0–100 npm weekly downloads proxy (same spirit as stars_log)."""
+    return min(100.0, 25.0 * math.log10(max(npm_weekly, 0) + 1))
+
+
 def _demand_evidence_points(
     *,
     stars: int | None,
     npm_weekly: int | None,
     market_tag: str,
-) -> int:
-    pts = 0
-    if stars is not None and stars > 50:
-        pts += 20
-    elif stars is not None and stars > 15:
-        pts += 10
-    npm_pts = 0
-    if npm_weekly is not None and npm_weekly >= 500:
-        npm_pts = 20
-    elif npm_weekly is not None and npm_weekly >= 100:
-        npm_pts = 10
+) -> tuple[int, dict[str, float | int | None]]:
+    """Demand 0–50 from log-scaled GitHub stars + npm weekly (scoring_guidance.md §2)."""
+    stars_log = _stars_log_norm(stars) if stars is not None else 0.0
+    npm_log = _npm_log_norm(npm_weekly) if npm_weekly is not None else 0.0
     if market_tag == "DEVTOOL" and npm_weekly is not None and npm_weekly < 100:
-        npm_pts = min(npm_pts, 5)
-    pts += npm_pts
-    return min(50, pts)
+        npm_log = min(npm_log, 28.0)
+
+    external_norm = 0.0  # reddit/discord/trends — extend when wired
+    if stars is None and npm_weekly is not None:
+        w_stars, w_npm = 0.0, 1.0
+    elif stars is not None and npm_weekly is None:
+        w_stars, w_npm = 1.0, 0.0
+    else:
+        # scoring_guidance.md §2: 0.6 * stars_log + 0.4 * external (npm proxy here).
+        w_stars, w_npm = 0.6, 0.4
+    combined = min(
+        100.0,
+        w_stars * stars_log + w_npm * npm_log + 0.10 * external_norm,
+    )
+    pts = int(round(combined / 100.0 * 50))
+    pts = min(50, max(0, pts))
+    audit = {
+        "stars_log": round(stars_log, 3) if stars is not None else None,
+        "npm_log": round(npm_log, 3) if npm_weekly is not None else None,
+        "demand_combined_100": round(combined, 3),
+    }
+    return pts, audit
+
+
+def _market_segment_fields(
+    market_tag: str,
+    name_lower: str,
+    readme_lower: str,
+    repo_path: Path,
+) -> tuple[str, str]:
+    """Audience lane for reporting — BoreDOOM-style titles → mass-market computer game."""
+    if market_tag != "GAME":
+        return ("na", "")
+    if _signals_consumer_game_home_ar(name_lower, readme_lower, repo_path):
+        return ("mass_market_computer_game", "Computer game for the masses")
+    return ("computer_game", "Computer game")
+
+
+def _scoring_confidence(
+    *,
+    stars: int | None,
+    npm_weekly: int | None,
+    has_readme: bool,
+    monetization_notes: str,
+) -> str:
+    """Low/Med/High proxy from observable data completeness (scoring_guidance.md §6)."""
+    k = 0
+    if stars is not None:
+        k += 1
+    if npm_weekly is not None:
+        k += 1
+    if has_readme:
+        k += 1
+    if (monetization_notes or "").strip():
+        k += 1
+    if k >= 4:
+        return "High"
+    if k >= 2:
+        return "Med"
+    return "Low"
 
 
 def _effort_to_monetize_score(
@@ -945,12 +1015,16 @@ def analyze_repo(repo_path: Path) -> dict:
         has_api=has_api,
     )
 
-    demand_pts = _demand_evidence_points(stars=stars, npm_weekly=npm_weekly, market_tag=market_tag)
+    demand_pts, demand_audit = _demand_evidence_points(
+        stars=stars, npm_weekly=npm_weekly, market_tag=market_tag
+    )
     infra_pts = _monetization_infra_points(repo_path, paths_lower)
     pain_pts = _painkiller_points(readme_lower)
 
     value = min(100, demand_pts + infra_pts + pain_pts)
     if demand_pts == 0:
+        value = min(value, 40)
+    if demand_pts < 5:
         value = min(value, 40)
     if market_tag == "GAME":
         value = min(value, 29)
@@ -1014,11 +1088,43 @@ def analyze_repo(repo_path: Path) -> dict:
         demand_hint_parts.append(f"npm last-week ≈ {npm_weekly}")
     demand_hint = "Demand signals: " + " · ".join(demand_hint_parts)
 
+    segment_slug, segment_label = _market_segment_fields(
+        market_tag, name_lower, readme_lower, repo_path
+    )
+    scoring_confidence = _scoring_confidence(
+        stars=stars,
+        npm_weekly=npm_weekly,
+        has_readme=has_readme,
+        monetization_notes="",
+    )
+    score_breakdown = {
+        "demand_pts": demand_pts,
+        "infra_pts": infra_pts,
+        "pain_pts": pain_pts,
+        "formula": "value=min(100,demand+infra+pain); demand=min(50,round(combined/100*50)); combined=0.6*stars_log+0.4*npm_log when both present",
+        **demand_audit,
+    }
+    caps_applied: list[str] = []
+    if demand_pts == 0:
+        caps_applied.append("demand_zero_cap40")
+    if demand_pts < 5:
+        caps_applied.append("demand_lt5_cap40")
+    if market_tag == "GAME":
+        caps_applied.append("game_cap29")
+    if market_tag == "DEVTOOL" and npm_weekly is not None and npm_weekly < 100:
+        if stars is None or stars <= 50:
+            caps_applied.append("devtool_low_npm_cap38")
+    score_breakdown["caps_applied"] = caps_applied
+
     return {
         "name": name,
         "path": str(repo_path.resolve()),
         "market_tag": market_tag,
+        "market_segment": segment_slug,
+        "market_segment_label": segment_label,
         "demand_evidence": demand_pts,
+        "scoring_confidence": scoring_confidence,
+        "score_breakdown": score_breakdown,
         "last_commit": last_commit,
         "commit_count": commit_count,
         "file_count": file_count,
@@ -1258,6 +1364,9 @@ def scan_projects(root: Path | None = None) -> list[dict]:
                 "name",
                 "market_tag",
                 "demand_evidence",
+                "market_segment",
+                "market_segment_label",
+                "scoring_confidence",
                 "total_score",
                 "value",
                 "progress",
@@ -1288,6 +1397,9 @@ def scan_projects(root: Path | None = None) -> list[dict]:
                     r["name"],
                     r.get("market_tag", ""),
                     r.get("demand_evidence", ""),
+                    r.get("market_segment", ""),
+                    r.get("market_segment_label", ""),
+                    r.get("scoring_confidence", ""),
                     r["total_score"],
                     s["value"],
                     s["progress"],
@@ -1352,6 +1464,9 @@ def save_repos(repos: list[dict]) -> None:
                 "name",
                 "market_tag",
                 "demand_evidence",
+                "market_segment",
+                "market_segment_label",
+                "scoring_confidence",
                 "total_score",
                 "value",
                 "progress",
@@ -1382,6 +1497,9 @@ def save_repos(repos: list[dict]) -> None:
                     r["name"],
                     r.get("market_tag", ""),
                     r.get("demand_evidence", ""),
+                    r.get("market_segment", ""),
+                    r.get("market_segment_label", ""),
+                    r.get("scoring_confidence", ""),
                     r["total_score"],
                     s["value"],
                     s["progress"],
@@ -1790,6 +1908,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       border-radius: 999px;
       white-space: nowrap;
     }
+    .segment-label {
+      font-size: 0.76rem;
+      font-weight: 500;
+      line-height: 1.25;
+      color: #e9ddff;
+      background: rgba(192, 132, 252, 0.12);
+      border: 1px solid rgba(192, 132, 252, 0.38);
+      padding: 0.18rem 0.55rem;
+      border-radius: 999px;
+      max-width: min(100%, 22rem);
+    }
   </style>
 </head>
 <body>
@@ -2076,11 +2205,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (roi.playbook_id) roiFootBits.push('playbook · ' + String(roi.playbook_id));
         if (altHum) roiFootBits.push('next best · ' + altHum);
         const roiFoot = roiFootBits.length ? escapeHtml(roiFootBits.join(' · ')) : '';
+        const segHtml = (r.market_segment_label || '').trim()
+          ? '<span class="segment-label" title="Audience segment (scoring_guidance.md taxonomy)">' + escapeHtml(String(r.market_segment_label).trim()) + '</span>'
+          : '';
         return `<article class="card ${hidCls}" data-name="${escapeHtml(r.name)}">
           <div class="top">
             <h2>${escapeHtml(r.name)}</h2>
             <span class="market-tag" title="Heuristic market tag (Meta/Cursor taxonomy)">${escapeHtml(r.market_tag || '—')}</span>
-            <span class="score-pill" title="Weighted heuristic score">${Number(r.total_score).toFixed(1)}</span>
+            ${segHtml}
+            <span class="score-pill" title="Weighted heuristic score · data confidence ${escapeHtml(r.scoring_confidence || '—')}">${Number(r.total_score).toFixed(1)}</span>
             <span class="${moneyCls}" title="${escapeHtml(moneyTitle)}">${escapeHtml(bandLabel)}</span>
             <span class="path">${escapeHtml(r.path)}</span>
           </div>
@@ -2572,7 +2705,9 @@ def report_repo_plain_block(r: dict) -> list[str]:
             f" package={r.get('has_package')} api_layout={r.get('has_api')}"
             f" docker={r.get('has_docker')}"
         ),
-        f"TAXONOMY: market_tag={r.get('market_tag', '?')} demand_evidence_pts={r.get('demand_evidence', '?')}",
+        f"TAXONOMY: market_tag={r.get('market_tag', '?')} | segment={r.get('market_segment', 'na')}",
+        f"  audience_label: {(r.get('market_segment_label') or '').strip() or '—'}",
+        f"DEMAND: evidence_pts={r.get('demand_evidence', '?')} · CONFIDENCE: {r.get('scoring_confidence', '?')}",
         (r.get("demand_hint") or "").strip(),
         "",
         "SCORES (0-100 heuristic):",
@@ -2581,17 +2716,33 @@ def report_repo_plain_block(r: dict) -> list[str]:
         f"  feature_potential       {s.get('feature_potential')}",
         f"  ship_monetise_ease      {s.get('effort_to_monetize')}",
         f"  weighted_total           {r.get('total_score')}",
-        "",
-        "REVENUE BAND (illustrative, USD):",
-        (
-            f"  {int(r.get('money_usd_low')):,} — {int(r.get('money_usd_high')):,} / year"
-            if r.get("money_usd_low") is not None and r.get("money_usd_high") is not None
-            else "  (not computed — rescan or reload index)"
-        ),
-        "",
-        "MONETISATION:",
-        f"  {mon.get('headline', '')}",
     ]
+    sb = r.get("score_breakdown")
+    if isinstance(sb, dict) and sb:
+        lines.extend(
+            [
+                "",
+                "SCORE_BREAKDOWN (audit — scoring_guidance.md):",
+                f"  demand_pts={sb.get('demand_pts')} infra_pts={sb.get('infra_pts')} pain_pts={sb.get('pain_pts')}",
+                f"  stars_log={sb.get('stars_log')} npm_log={sb.get('npm_log')} demand_combined_100={sb.get('demand_combined_100')}",
+                f"  caps_applied: {', '.join(sb.get('caps_applied') or []) or '—'}",
+                f"  formula_note: {sb.get('formula', '')}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "REVENUE BAND (illustrative, USD):",
+            (
+                f"  {int(r.get('money_usd_low')):,} — {int(r.get('money_usd_high')):,} / year"
+                if r.get("money_usd_low") is not None and r.get("money_usd_high") is not None
+                else "  (not computed — rescan or reload index)"
+            ),
+            "",
+            "MONETISATION:",
+            f"  {mon.get('headline', '')}",
+        ]
+    )
     for p in mon.get("paths") or []:
         lines.append(f"  · [{p.get('model', '?')}] {p.get('title')}: {p.get('detail')}")
     lines.extend(
@@ -2661,7 +2812,8 @@ def build_report_bytes(fmt: str, subset: str, repos_in: list[dict]) -> tuple[byt
                     f"## {r.get('name', '?')}",
                     "",
                     f"- Path: `{r.get('path')}`",
-                    f"- Market tag: `{r.get('market_tag', '—')}` · demand evidence (auto): **{r.get('demand_evidence', '—')}**/50",
+                    f"- Market tag: `{r.get('market_tag', '—')}` · segment: **`{r.get('market_segment', 'na')}`** — {(r.get('market_segment_label') or '').strip() or '—'}",
+                    f"- Demand evidence (auto): **{r.get('demand_evidence', '—')}**/50 · Confidence: **{r.get('scoring_confidence', '—')}**",
                     f"- Signals: readme={r.get('has_readme')} lic={r.get('has_license')}"
                     f" pkg={r.get('has_package')} api={r.get('has_api')} docker={r.get('has_docker')}",
                     "",
@@ -2721,6 +2873,9 @@ def build_report_bytes(fmt: str, subset: str, repos_in: list[dict]) -> tuple[byt
                 "name",
                 "market_tag",
                 "demand_evidence",
+                "market_segment",
+                "market_segment_label",
+                "scoring_confidence",
                 "total_score",
                 "value",
                 "progress",
@@ -2747,6 +2902,9 @@ def build_report_bytes(fmt: str, subset: str, repos_in: list[dict]) -> tuple[byt
                     r.get("name"),
                     r.get("market_tag", ""),
                     r.get("demand_evidence", ""),
+                    r.get("market_segment", ""),
+                    r.get("market_segment_label", ""),
+                    r.get("scoring_confidence", ""),
                     r.get("total_score"),
                     s.get("value"),
                     s.get("progress"),
