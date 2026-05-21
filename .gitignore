@@ -17,3 +17,6 @@ project_index/**
 .vscode/
 *.swp
 .DS_Store
+
+# Local rolling log (FLINTNEEDLE / CSOP); not committed
+TRANSCRIPT.md

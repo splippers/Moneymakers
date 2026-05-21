@@ -15,8 +15,8 @@ Scan a directory of git repositories, apply monetization heuristics, and priorit
 From this repository root:
 
 ```bash
-python3 projectscan.py              # scan sibling folders under the parent of this repo
-python3 projectscan.py serve        # dashboard at http://127.0.0.1:8765
+python3 projectscan.py              # scan repos under NerveCentre (../ or Eddie/Marvin mounts); override with PROJECTSCAN_ROOT
+python3 projectscan.py serve        # dashboard on LAN (0.0.0.0:8765); http://127.0.0.1:8765 works locally
 ```
 
 Point at another tree of projects:
@@ -25,6 +25,8 @@ Point at another tree of projects:
 export PROJECTSCAN_ROOT=/path/to/projects
 python3 projectscan.py serve
 ```
+
+Listen on loopback only (no LAN): `export PROJECTSCAN_HOST=127.0.0.1` before `serve`.
 
 ### Optional: Google Drive
 

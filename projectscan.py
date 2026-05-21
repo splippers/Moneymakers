@@ -3,17 +3,21 @@
 Scan a directory of git projects, score them heuristically, and optionally
 serve a small local dashboard to prioritise and annotate what to work on next.
 
-Defaults (no env): scan sibling folders of this repo's parent — i.e. with the
-script at ``Projects/moneymakers/projectscan.py``, repos are ``Projects/*/`` and
-the index is written to ``Projects/moneymakers/project_index/``.
+Defaults (no env): scan git repos under ``NerveCentre``. Resolved as this checkout's
+sibling ``../NerveCentre`` when that directory exists; otherwise the canonical Splippers
+workspace on **Eddie** or **Marvin** — ``/mnt/EDDIE-SANDIEGO/Projects/NerveCentre`` or
+``/mnt/MARVIN-SANDIEGO/Projects/NerveCentre`` when present (hostname prefers the matching mount).
+Override with ``PROJECTSCAN_ROOT``. Index files stay in ``project_index/`` here.
 
 Usage:
   python3 projectscan.py              # scan only
-  python3 projectscan.py serve        # dashboard at http://127.0.0.1:8765
+  python3 projectscan.py serve        # dashboard on all interfaces (LAN); also http://127.0.0.1:8765 locally
   PROJECTSCAN_ROOT=/path/to/projects python3 projectscan.py serve
+  PROJECTSCAN_HOST=127.0.0.1 python3 projectscan.py serve   # loopback-only (no LAN)
+  PROJECTSCAN_PORT=1066 PROJECTSCAN_PUBLIC_ORIGIN=http://192.168.1.2:1066 python3 projectscan.py serve   # fixed port + bookmark URL
 
-Env overrides: ``PROJECTSCAN_ROOT``, ``PROJECTSCAN_INDEX_DIR``, ``PROJECTSCAN_PORT`` (serve),
-``PROJECTSCAN_PUBLIC_ORIGIN`` (e.g. ``http://192.168.1.2`` — full URL for the Drive setup guide link when nginx serves the portal at a LAN address),
+Env overrides: ``PROJECTSCAN_ROOT``, ``PROJECTSCAN_INDEX_DIR``, ``PROJECTSCAN_HOST`` / ``PROJECTSCAN_PORT`` (serve bind; default host ``0.0.0.0`` for LAN),
+``PROJECTSCAN_PUBLIC_ORIGIN`` (e.g. ``http://192.168.1.2:1066`` — bookmark URL for LAN browsers and for Drive setup guide links),
 ``PROJECTSCAN_EXTRA_ROOTS`` (comma-separated git repo paths to merge into the scan).
 Optional: ``GITHUB_TOKEN`` raises GitHub API rate limits when resolving star counts for demand signals.
 
@@ -47,6 +51,7 @@ import json
 import math
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -63,12 +68,45 @@ def _script_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _hostname_slug() -> str:
+    try:
+        return socket.gethostname().split(".")[0].lower()
+    except OSError:
+        return ""
+
+
+def _default_nervecentre_root() -> Path:
+    """Prefer sibling ``../NerveCentre``; else Eddie/Marvin canonical Projects mounts."""
+    sibling = _script_dir().parent / "NerveCentre"
+    if sibling.is_dir():
+        return sibling.resolve()
+
+    host = _hostname_slug()
+    candidates: list[Path] = []
+    if "marvin" in host:
+        candidates.append(Path("/mnt/MARVIN-SANDIEGO/Projects/NerveCentre"))
+    if "eddie" in host:
+        candidates.append(Path("/mnt/EDDIE-SANDIEGO/Projects/NerveCentre"))
+    candidates.append(Path("/mnt/MARVIN-SANDIEGO/Projects/NerveCentre"))
+    candidates.append(Path("/mnt/EDDIE-SANDIEGO/Projects/NerveCentre"))
+
+    seen: set[str] = set()
+    for p in candidates:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.is_dir():
+            return p.resolve()
+
+    return sibling.resolve()
+
+
 def projects_dir() -> Path:
     raw = os.environ.get("PROJECTSCAN_ROOT")
     if raw:
         return Path(raw).expanduser()
-    # ``moneymakers`` (or any checkout) lives next to other project repos
-    return _script_dir().parent
+    return _default_nervecentre_root()
 
 
 def index_dir() -> Path:
@@ -3355,7 +3393,16 @@ def serve(host: str, port: int, scan_first: bool) -> None:
         print("Scanning before serve…")
         scan_projects()
     server = ThreadingHTTPServer((host, port), DashboardHandler)
-    print(f"Dashboard: http://{host}:{port}")
+    print(f"Listening on http://{host}:{port}/")
+    origin = (os.environ.get("PROJECTSCAN_PUBLIC_ORIGIN") or "").strip().rstrip("/")
+    if host in ("0.0.0.0", "::") and origin:
+        print(f"LAN URL (PROJECTSCAN_PUBLIC_ORIGIN): {origin}/")
+    elif host in ("0.0.0.0", "::"):
+        print(
+            "Bound on all interfaces — from another machine use "
+            f"http://<this-host-LAN-IP>:{port}/ "
+            "(set PROJECTSCAN_PUBLIC_ORIGIN to print your exact URL here)."
+        )
     print(f"Projects root: {projects_dir().resolve()}")
     print("Press Ctrl+C to stop.")
     try:
@@ -3367,12 +3414,17 @@ def serve(host: str, port: int, scan_first: bool) -> None:
 
 
 def main() -> None:
+    serve_host_default = (os.environ.get("PROJECTSCAN_HOST") or "0.0.0.0").strip() or "0.0.0.0"
     serve_port_default = int(os.environ.get("PROJECTSCAN_PORT", "8765"))
     parser = argparse.ArgumentParser(description="Scan and prioritise local git projects.")
     sub = parser.add_subparsers(dest="command")
 
-    p_serve = sub.add_parser("serve", help="Run local dashboard (default host 127.0.0.1)")
-    p_serve.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1)")
+    p_serve = sub.add_parser("serve", help="Run dashboard HTTP server (default bind 0.0.0.0 — reachable on LAN)")
+    p_serve.add_argument(
+        "--host",
+        default=serve_host_default,
+        help="Bind address (default: $PROJECTSCAN_HOST or 0.0.0.0 for LAN; use 127.0.0.1 for this machine only)",
+    )
     p_serve.add_argument(
         "--port",
         type=int,
